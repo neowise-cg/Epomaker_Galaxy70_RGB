@@ -33,7 +33,8 @@ A Python (Tkinter) GUI utility for visual customization and generation of RGB li
 
 ## 📸 Screenshot
 
-![Galaxy 70 Customizer Interface](<img width="1214" height="652" alt="image" src="https://github.com/user-attachments/assets/0c187354-f4aa-477c-9d63-cadce45f80e5" />)
+<img width="1214" height="652" alt="image" src="https://github.com/user-attachments/assets/88b341ee-3c58-4401-a27b-f736d4ffa420" />
+
 
 ---
 
