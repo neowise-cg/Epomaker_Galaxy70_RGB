@@ -33,7 +33,8 @@ A Python (Tkinter) GUI utility for visual customization and generation of RGB li
 
 ## 📸 Screenshot
 
-<img width="1215" height="655" alt="image" src="https://github.com/user-attachments/assets/b0a96c46-af0a-468b-b8f1-f0360e6da382" />
+<img width="1211" height="647" alt="image" src="https://github.com/user-attachments/assets/0b6e7fca-e61f-4e95-8237-0ab52e37421a" />
+
 
 
 
