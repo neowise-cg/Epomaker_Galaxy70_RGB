@@ -46,7 +46,7 @@ A Python (Tkinter) GUI utility for visual customization and generation of RGB li
 The easiest way is to download the pre-compiled `.exe` file:
 
 1. Go to the **[Releases](../../releases)** section on GitHub.
-2. Download `Galaxy.70.Customizer.exe`
+2. Download `Galaxy_70_Customizer.exe`
 3. Run the executable 
 
 ---
