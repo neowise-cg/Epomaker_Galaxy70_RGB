@@ -25,6 +25,7 @@ A Python (Tkinter) GUI utility for visual customization and generation of RGB li
   - Box selection (Marquee Select).
   - Add keys to selection (`Ctrl` + Left Mouse Drag/Click).
   - Remove keys from selection (`Shift` + Left Mouse Drag/Click).
+- **💡 Live RGB Apply:** Send the currently displayed lighting configuration directly from the virtual keyboard to the connected physical **Epomaker Galaxy 70** using the **`Apply RGB`** button, allowing you to preview your custom lighting on the real keyboard without exporting an XML file first.
 - **💾 Custom Project Format (`.eglx`):** Save your current work state, selected keys, filters, and gradient settings to continue later.
 - **📄 XML Import & Export:** Full compatibility with official keyboard lighting profiles.
 - **🌐 Dual-Language Interface:** On-the-fly UI language switching (`RU` / `EN`).
