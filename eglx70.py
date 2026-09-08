@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import ctypes
+import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -87,6 +88,478 @@ def rgb_to_colorref(r, g, b):
 def get_text_color(r, g, b):
     luminance = 0.299 * r + 0.587 * g + 0.114 * b
     return "#000000" if luminance > 128 else "#ffffff"
+
+
+# ---------------------------------------------------------------------------
+# Galaxy 70 HID transport
+# ---------------------------------------------------------------------------
+# The working Galaxy70 PowerShell script talks to the lighting HID interface
+# directly. The implementation below mirrors its protocol without creating a
+# temporary .ps1 file:
+#
+#   PING -> BEGIN -> 20 DATA frames -> END
+#
+# The device exposes a 33-byte HID report: one report-ID byte (0) followed by
+# the 32-byte protocol frame. DATA block 0 is special (6 keys, bytes 7..30),
+# the remaining blocks contain 7 four-byte key/RGB entries starting at byte 3.
+
+KEY_CODE_TO_SLOT = {
+    # Function row
+    41: 1, 58: 2, 59: 3, 60: 4, 61: 5, 62: 6, 63: 7,
+    64: 8, 65: 9, 66: 10, 67: 11, 68: 12, 69: 13, 70: 112,
+    # Number row + navigation
+    53: 19, 30: 20, 31: 21, 32: 22, 33: 23, 34: 24, 35: 25,
+    36: 26, 37: 27, 38: 28, 39: 29, 45: 30, 46: 31, 42: 103,
+    74: 117, 75: 118,
+    # QWERTY row
+    43: 37, 20: 38, 26: 39, 8: 40, 21: 41, 23: 42, 28: 43,
+    24: 44, 12: 45, 18: 46, 19: 47, 47: 48, 48: 49, 49: 67,
+    76: 119, 78: 121,
+    # ASDF row
+    57: 55, 4: 56, 22: 57, 7: 58, 9: 59, 10: 60, 11: 61,
+    13: 62, 14: 63, 15: 64, 51: 65, 52: 66, 40: 85,
+    # ZXCV row
+    225: 73, 29: 74, 27: 75, 6: 76, 25: 77, 5: 78, 17: 79,
+    16: 80, 54: 81, 55: 82, 56: 83, 229: 84, 82: 101,
+    # Bottom row
+    224: 91, 227: 92, 226: 93, 44: 94, 230: 95, 175: 96,
+    228: 98, 80: 99, 81: 100, 79: 102,
+}
+
+ACTIVE_KEY_INDICES = list(KEY_CODE_TO_SLOT.values())
+
+
+def _checksum_31(body31):
+    return sum(body31) & 0xFF
+
+
+def _make_frame(body31):
+    if len(body31) != 31:
+        raise ValueError("Internal HID error: frame body must contain 31 bytes.")
+    return bytes(body31) + bytes([_checksum_31(body31)])
+
+
+def _make_ping_frame():
+    body = bytearray(31)
+    body[0] = 0x20
+    body[1] = 0x01
+    return _make_frame(body)
+
+
+def _make_begin_frame():
+    body = bytearray(31)
+    body[0] = 0x05
+    body[1] = 0x10
+    body[3] = 0x80
+    body[12] = 0x05
+    body[17] = 0xAA
+    body[18] = 0x55
+    return _make_frame(body)
+
+
+def _make_end_frame(total_blocks=20):
+    body = bytearray(31)
+    body[0] = 0x14
+    body[1] = 0x10
+    body[2] = total_blocks & 0xFF
+    body[17] = 0xAA
+    body[18] = 0x55
+    return _make_frame(body)
+
+
+def _make_data_frame(block_index, color_map):
+    body = bytearray(31)
+    body[0] = 0x14
+    body[1] = 0x1C
+    body[2] = block_index & 0xFF
+
+    if block_index == 0:
+        start_key = 1
+        slot_count = 6
+        data_offset = 7
+    else:
+        start_key = 7 * block_index
+        slot_count = 7
+        data_offset = 3
+
+    for s in range(slot_count):
+        key_index = start_key + s
+        rgb = color_map.get(key_index)
+        if rgb is None:
+            continue
+
+        off = data_offset + s * 4
+        body[off] = key_index & 0xFF
+        body[off + 1] = int(rgb[0]) & 0xFF
+        body[off + 2] = int(rgb[1]) & 0xFF
+        body[off + 3] = int(rgb[2]) & 0xFF
+
+    return _make_frame(body)
+
+
+def _build_command_sequence(color_map):
+    sequence = [_make_ping_frame(), _make_begin_frame()]
+    sequence.extend(_make_data_frame(block, color_map) for block in range(20))
+    sequence.append(_make_end_frame(20))
+    return sequence
+
+
+class Galaxy70HidTransport:
+    """Minimal ctypes port of the proven Galaxy70 PowerShell HID transport."""
+
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    OPEN_EXISTING = 3
+    FILE_FLAG_OVERLAPPED = 0x40000000
+    DIGCF_PRESENT = 0x00000002
+    DIGCF_DEVICEINTERFACE = 0x00000010
+    ERROR_IO_PENDING = 997
+    WAIT_OBJECT_0 = 0x00000000
+    WAIT_TIMEOUT = 0x00000102
+    INFINITE = 0xFFFFFFFF
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    def __init__(self):
+        if sys.platform != "win32":
+            raise RuntimeError("Apply RGB is supported on Windows only.")
+
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.hid = ctypes.WinDLL("hid", use_last_error=True)
+        self.setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
+
+        self._define_structs()
+        self._define_functions()
+
+    def _define_structs(self):
+        class SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.c_uint32),
+                ("InterfaceClassGuid", ctypes.c_byte * 16),
+                ("Flags", ctypes.c_uint32),
+                ("Reserved", ctypes.c_void_p),
+            ]
+
+        class HIDP_CAPS(ctypes.Structure):
+            _fields_ = [
+                ("Usage", ctypes.c_uint16),
+                ("UsagePage", ctypes.c_uint16),
+                ("InputReportByteLength", ctypes.c_uint16),
+                ("OutputReportByteLength", ctypes.c_uint16),
+                ("FeatureReportByteLength", ctypes.c_uint16),
+                ("Reserved", ctypes.c_uint16 * 17),
+                ("NumberLinkCollectionNodes", ctypes.c_uint16),
+                ("NumberInputButtonCaps", ctypes.c_uint16),
+                ("NumberInputValueCaps", ctypes.c_uint16),
+                ("NumberInputDataIndices", ctypes.c_uint16),
+                ("NumberOutputButtonCaps", ctypes.c_uint16),
+                ("NumberOutputValueCaps", ctypes.c_uint16),
+                ("NumberOutputDataIndices", ctypes.c_uint16),
+                ("NumberFeatureButtonCaps", ctypes.c_uint16),
+                ("NumberFeatureValueCaps", ctypes.c_uint16),
+                ("NumberFeatureDataIndices", ctypes.c_uint16),
+            ]
+
+        class OVERLAPPED(ctypes.Structure):
+            _fields_ = [
+                ("Internal", ctypes.c_void_p),
+                ("InternalHigh", ctypes.c_void_p),
+                ("Offset", ctypes.c_uint32),
+                ("OffsetHigh", ctypes.c_uint32),
+                ("hEvent", ctypes.c_void_p),
+            ]
+
+        self.SP_DEVICE_INTERFACE_DATA = SP_DEVICE_INTERFACE_DATA
+        self.HIDP_CAPS = HIDP_CAPS
+        self.OVERLAPPED = OVERLAPPED
+
+    def _define_functions(self):
+        k32 = self.kernel32
+        hid = self.hid
+        setup = self.setupapi
+
+        k32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p
+        ]
+        k32.CreateFileW.restype = ctypes.c_void_p
+
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        k32.CloseHandle.restype = ctypes.c_int
+
+        k32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p]
+        k32.CreateEventW.restype = ctypes.c_void_p
+
+        k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        k32.WaitForSingleObject.restype = ctypes.c_uint32
+
+        k32.WriteFile.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.POINTER(self.OVERLAPPED)
+        ]
+        k32.WriteFile.restype = ctypes.c_int
+
+        k32.ReadFile.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.POINTER(self.OVERLAPPED)
+        ]
+        k32.ReadFile.restype = ctypes.c_int
+
+        k32.GetOverlappedResult.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(self.OVERLAPPED),
+            ctypes.POINTER(ctypes.c_uint32), ctypes.c_int
+        ]
+        k32.GetOverlappedResult.restype = ctypes.c_int
+
+        k32.CancelIo.argtypes = [ctypes.c_void_p]
+        k32.CancelIo.restype = ctypes.c_int
+
+        hid.HidD_GetHidGuid.argtypes = [ctypes.POINTER(ctypes.c_byte * 16)]
+        hid.HidD_GetHidGuid.restype = None
+
+        hid.HidD_GetPreparsedData.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        hid.HidD_GetPreparsedData.restype = ctypes.c_int
+
+        hid.HidD_FreePreparsedData.argtypes = [ctypes.c_void_p]
+        hid.HidD_FreePreparsedData.restype = ctypes.c_int
+
+        hid.HidP_GetCaps.argtypes = [ctypes.c_void_p, ctypes.POINTER(self.HIDP_CAPS)]
+        hid.HidP_GetCaps.restype = ctypes.c_int32
+
+        setup.SetupDiGetClassDevsW.argtypes = [
+            ctypes.POINTER(ctypes.c_byte * 16), ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_uint32
+        ]
+        setup.SetupDiGetClassDevsW.restype = ctypes.c_void_p
+
+        setup.SetupDiEnumDeviceInterfaces.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_byte * 16), ctypes.c_uint32,
+            ctypes.POINTER(self.SP_DEVICE_INTERFACE_DATA)
+        ]
+        setup.SetupDiEnumDeviceInterfaces.restype = ctypes.c_int
+
+        setup.SetupDiGetDeviceInterfaceDetailW.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(self.SP_DEVICE_INTERFACE_DATA),
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_void_p
+        ]
+        setup.SetupDiGetDeviceInterfaceDetailW.restype = ctypes.c_int
+
+        setup.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
+        setup.SetupDiDestroyDeviceInfoList.restype = ctypes.c_int
+
+    @staticmethod
+    def _guid_from_bytes(guid_bytes):
+        guid = (ctypes.c_byte * 16)()
+        ctypes.memmove(ctypes.byref(guid), guid_bytes, 16)
+        return guid
+
+    def find_lighting_interface(self):
+        guid = (ctypes.c_byte * 16)()
+        self.hid.HidD_GetHidGuid(ctypes.byref(guid))
+
+        device_set = self.setupapi.SetupDiGetClassDevsW(
+            ctypes.byref(guid), None, None,
+            self.DIGCF_PRESENT | self.DIGCF_DEVICEINTERFACE
+        )
+        if device_set == self.INVALID_HANDLE_VALUE or not device_set:
+            error = ctypes.get_last_error()
+            raise RuntimeError(f"Cannot enumerate HID devices. Windows error {error}.")
+
+        try:
+            index = 0
+            while True:
+                interface_data = self.SP_DEVICE_INTERFACE_DATA()
+                interface_data.cbSize = ctypes.sizeof(self.SP_DEVICE_INTERFACE_DATA)
+
+                ok = self.setupapi.SetupDiEnumDeviceInterfaces(
+                    device_set, None, ctypes.byref(guid), index,
+                    ctypes.byref(interface_data)
+                )
+                if not ok:
+                    break
+
+                required = ctypes.c_uint32(0)
+                self.setupapi.SetupDiGetDeviceInterfaceDetailW(
+                    device_set, ctypes.byref(interface_data), None, 0,
+                    ctypes.byref(required), None
+                )
+                if required.value == 0:
+                    index += 1
+                    continue
+
+                detail = ctypes.create_string_buffer(required.value)
+                cb_size = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6
+                ctypes.memmove(detail, ctypes.byref(ctypes.c_uint32(cb_size)), 4)
+
+                ok = self.setupapi.SetupDiGetDeviceInterfaceDetailW(
+                    device_set, ctypes.byref(interface_data), detail,
+                    required.value, ctypes.byref(required), None
+                )
+                if not ok:
+                    index += 1
+                    continue
+
+                path = ctypes.wstring_at(ctypes.addressof(detail) + 4)
+                if "vid_05ac&pid_024f" not in path.lower():
+                    index += 1
+                    continue
+
+                handle = self.kernel32.CreateFileW(
+                    path,
+                    self.GENERIC_READ | self.GENERIC_WRITE,
+                    self.FILE_SHARE_READ | self.FILE_SHARE_WRITE,
+                    None,
+                    self.OPEN_EXISTING,
+                    0,
+                    None,
+                )
+                if not handle or handle == self.INVALID_HANDLE_VALUE:
+                    index += 1
+                    continue
+
+                try:
+                    preparsed = ctypes.c_void_p()
+                    if not self.hid.HidD_GetPreparsedData(handle, ctypes.byref(preparsed)):
+                        index += 1
+                        continue
+                    try:
+                        caps = self.HIDP_CAPS()
+                        status = self.hid.HidP_GetCaps(preparsed, ctypes.byref(caps))
+                        if status >= 0 and caps.OutputReportByteLength == 33 and caps.InputReportByteLength == 33:
+                            return path
+                    finally:
+                        self.hid.HidD_FreePreparsedData(preparsed)
+                finally:
+                    self.kernel32.CloseHandle(handle)
+
+                index += 1
+        finally:
+            self.setupapi.SetupDiDestroyDeviceInfoList(device_set)
+
+        return None
+
+    def _open_overlapped(self, path):
+        handle = self.kernel32.CreateFileW(
+            path,
+            self.GENERIC_READ | self.GENERIC_WRITE,
+            self.FILE_SHARE_READ | self.FILE_SHARE_WRITE,
+            None,
+            self.OPEN_EXISTING,
+            self.FILE_FLAG_OVERLAPPED,
+            None,
+        )
+        if not handle or handle == self.INVALID_HANDLE_VALUE:
+            error = ctypes.get_last_error()
+            raise RuntimeError(
+                f"The Galaxy 70 lighting HID interface could not be opened. Windows error {error}."
+            )
+        return handle
+
+    def _write_then_read(self, handle, report, read_size=33, timeout_ms=300):
+        write_event = self.kernel32.CreateEventW(None, True, False, None)
+        read_event = self.kernel32.CreateEventW(None, True, False, None)
+        if not write_event or not read_event:
+            if write_event:
+                self.kernel32.CloseHandle(write_event)
+            if read_event:
+                self.kernel32.CloseHandle(read_event)
+            raise RuntimeError("Could not create Windows HID events.")
+
+        try:
+            write_buffer = ctypes.create_string_buffer(report)
+            ov_write = self.OVERLAPPED()
+            ov_write.hEvent = write_event
+
+            ok = self.kernel32.WriteFile(
+                handle, write_buffer, len(report), None, ctypes.byref(ov_write)
+            )
+            if not ok:
+                error = ctypes.get_last_error()
+                if error != self.ERROR_IO_PENDING:
+                    raise RuntimeError(f"WriteFile failed. Windows error {error}.")
+                wait_result = self.kernel32.WaitForSingleObject(write_event, timeout_ms)
+                if wait_result == self.WAIT_TIMEOUT:
+                    self.kernel32.CancelIo(handle)
+                    raise RuntimeError("WriteFile timed out.")
+                if wait_result != self.WAIT_OBJECT_0:
+                    self.kernel32.CancelIo(handle)
+                    raise RuntimeError(f"WriteFile wait failed: {wait_result}.")
+
+                written = ctypes.c_uint32(0)
+                if not self.kernel32.GetOverlappedResult(
+                    handle, ctypes.byref(ov_write), ctypes.byref(written), False
+                ):
+                    error = ctypes.get_last_error()
+                    raise RuntimeError(f"WriteFile overlapped result failed. Windows error {error}.")
+
+            read_buffer = ctypes.create_string_buffer(read_size)
+            ov_read = self.OVERLAPPED()
+            ov_read.hEvent = read_event
+
+            ok = self.kernel32.ReadFile(
+                handle, read_buffer, read_size, None, ctypes.byref(ov_read)
+            )
+            if not ok:
+                error = ctypes.get_last_error()
+                if error != self.ERROR_IO_PENDING:
+                    return None
+                wait_result = self.kernel32.WaitForSingleObject(read_event, timeout_ms)
+                if wait_result == self.WAIT_TIMEOUT:
+                    self.kernel32.CancelIo(handle)
+                    return None
+                if wait_result != self.WAIT_OBJECT_0:
+                    return None
+
+                read = ctypes.c_uint32(0)
+                if not self.kernel32.GetOverlappedResult(
+                    handle, ctypes.byref(ov_read), ctypes.byref(read), False
+                ):
+                    return None
+
+            return bytes(read_buffer.raw[:read_size])
+        finally:
+            self.kernel32.CloseHandle(write_event)
+            self.kernel32.CloseHandle(read_event)
+
+    def apply_rgb_map(self, color_map):
+        path = self.find_lighting_interface()
+        if not path:
+            raise RuntimeError(
+                "The Galaxy 70 lighting interface (VID_05AC&PID_024F, 33-byte HID collection) "
+                "was not found. Make sure the 2.4 GHz receiver is connected."
+            )
+
+        handle = self._open_overlapped(path)
+        try:
+            sequence = _build_command_sequence(color_map)
+            for frame in sequence:
+                report = bytes([0]) + frame
+                self._write_then_read(handle, report, 33, 300)
+                time_sleep = 0.005
+                # Keep parity with the working PS1 script without importing an
+                # additional module just for a five-millisecond pause.
+                import time
+                time.sleep(time_sleep)
+        finally:
+            self.kernel32.CloseHandle(handle)
+
+
+def build_live_color_map(app):
+    """Collect the final RGB shown by the virtual keyboard and map to HID slots."""
+    color_map = {}
+    for key_code in KEYBOARD_LAYOUT:
+        color_data = app.get_key_effective_color(key_code)
+        if color_data is None:
+            continue
+        _, (r, g, b), _ = color_data
+        color_map[KEY_CODE_TO_SLOT[key_code]] = (r, g, b)
+
+    if set(color_map) - set(ACTIVE_KEY_INDICES):
+        raise RuntimeError("Internal key mapping error: unsupported lighting slot.")
+    return color_map
 
 
 class PhotoshopColorPicker(tk.Frame):
@@ -322,8 +795,12 @@ LANG = {
         "import_first": "Сначала импортируйте XML-файл!",
         "xml_saved": "Конфигурация сохранена:\n{path}",
         "xml_export_error": "Не удалось экспортировать файл:\n{error}",
-        "custom_profile": "Custom",
+        "custom_profile": "Custom Light",
         "profile": "Профиль: {name}",
+        "apply_rgb": "Apply RGB",
+        "apply_rgb_sending": "Отправка RGB на клавиатуру…",
+        "apply_rgb_success": "Подсветка применена к клавиатуре.",
+        "apply_rgb_error": "Не удалось применить подсветку:\n{error}",
     },
     "en": {
         "title": "Galaxy 70 Customizer",
@@ -381,8 +858,12 @@ LANG = {
         "import_first": "Import an XML file first!",
         "xml_saved": "Configuration saved:\n{path}",
         "xml_export_error": "Could not export file:\n{error}",
-        "custom_profile": "Custom",
+        "custom_profile": "Custom Light",
         "profile": "Profile: {name}",
+        "apply_rgb": "Apply RGB",
+        "apply_rgb_sending": "Sending RGB to keyboard…",
+        "apply_rgb_success": "RGB lighting applied to the keyboard.",
+        "apply_rgb_error": "Could not apply RGB lighting:\n{error}",
     }
 }
 
@@ -393,7 +874,7 @@ GRAD_METHOD_KEYS = {"rgb": ("RGB — классический", "RGB — Classic
 class KeyboardVisualizerApp:
     def __init__(self, root):
         self.root = root
-        self.lang = "ru"
+        self.lang = "en"
         self.root.title(LANG[self.lang]["title"])
         self.root.configure(bg="#1e1e24")
         self.root.geometry("1220x625")
@@ -424,13 +905,22 @@ class KeyboardVisualizerApp:
 
         self.setup_ui()
 
-        # Горячие клавиши проекта.
+        # Горячие клавиши проекта
         self.root.bind("<Control-s>", lambda e: self.save_project())
         self.root.bind("<Control-o>", lambda e: self.open_project())
 
     def tr(self, key, **kwargs):
         text = LANG[self.lang][key]
         return text.format(**kwargs) if kwargs else text
+
+    def create_default_xml_tree(self):
+        """Создает дефолтное XML-дерево с правильным корневым тегом userlight."""
+        root = ET.Element("userlight")
+        ET.SubElement(root, "lightinfo", name=self.profile_name or self.tr("custom_profile"))
+        keyinfo = ET.SubElement(root, "keyinfo")
+        for code in KEYBOARD_LAYOUT.keys():
+            ET.SubElement(keyinfo, "item", key_code=str(code), key_rgb="0")
+        return ET.ElementTree(root)
 
     def set_language(self, lang):
         if lang not in LANG or lang == self.lang:
@@ -585,11 +1075,29 @@ class KeyboardVisualizerApp:
         main_container = tk.Frame(self.root, bg="#1e1e24")
         main_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 15))
 
+        self.keyboard_area = tk.Frame(main_container, bg="#1e1e24")
+        self.keyboard_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
         self.canvas = tk.Canvas(
-            main_container, width=880, height=330,
+            self.keyboard_area, width=880, height=330,
             bg="#121214", highlightthickness=1, highlightbackground="#333338"
         )
-        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        self.btn_apply_rgb = tk.Button(
+            self.keyboard_area,
+            text=self.tr("apply_rgb"),
+            command=self.apply_rgb_to_keyboard,
+            font=("Segoe UI", 10, "bold"),
+            bg="#28a745",
+            fg="white",
+            activebackground="#218838",
+            activeforeground="white",
+            relief=tk.FLAT,
+            pady=7,
+            cursor="hand2"
+        )
+        self.btn_apply_rgb.pack(fill=tk.X, pady=(10, 0))
 
         self.key_size = 45
         self.gap = 5
@@ -1144,6 +1652,36 @@ class KeyboardVisualizerApp:
         picker.draw_hue_marker()
         picker.draw_sv_square()
 
+    def apply_rgb_to_keyboard(self):
+        """Send the current virtual-keyboard RGB state directly to Galaxy 70."""
+        try:
+            color_map = build_live_color_map(self)
+        except Exception as e:
+            messagebox.showerror(self.tr("error"), str(e))
+            return
+
+        self.btn_apply_rgb.config(state=tk.DISABLED, text=self.tr("apply_rgb_sending"))
+        self.lbl_info.config(text=self.tr("apply_rgb_sending"))
+
+        def worker():
+            try:
+                Galaxy70HidTransport().apply_rgb_map(color_map)
+            except Exception as exc:  # noqa: BLE001
+                self.root.after(0, lambda: self._finish_apply_rgb(False, str(exc)))
+            else:
+                self.root.after(0, lambda: self._finish_apply_rgb(True, None))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_apply_rgb(self, success, error_text):
+        self.btn_apply_rgb.config(state=tk.NORMAL, text=self.tr("apply_rgb"))
+        if success:
+            self.lbl_info.config(text=self.tr("apply_rgb_success"))
+            messagebox.showinfo(self.tr("success"), self.tr("apply_rgb_success"))
+        else:
+            self.lbl_info.config(text=self.tr("error"))
+            messagebox.showerror(self.tr("error"), self.tr("apply_rgb_error", error=error_text))
+
     def save_project(self):
         if not self.xml_tree:
             answer = messagebox.askyesno(
@@ -1430,30 +1968,77 @@ class KeyboardVisualizerApp:
 
     def export_xml(self):
         if not self.xml_tree:
-            messagebox.showwarning(self.tr("warning"), self.tr("import_first"))
-            return
-        file_path = filedialog.asksaveasfilename(defaultextension=".xml", filetypes=[("XML files" if self.lang == "en" else "XML-файлы", "*.xml")], initialfile="Custom_Keyboard_Light.xml")
+            self.xml_tree = self.create_default_xml_tree()
+
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".xml", 
+            filetypes=[("XML files" if self.lang == "en" else "XML-файлы", "*.xml")], 
+            initialfile="Custom_Keyboard_Light.xml"
+        )
         if not file_path:
             return
         try:
             root_elem = self.xml_tree.getroot()
+            root_elem.tag = "userlight"
+
+            # Синхронизация блока lightinfo
+            lightinfo = root_elem.find("lightinfo")
+            if lightinfo is None:
+                lightinfo = ET.Element("lightinfo")
+                root_elem.insert(0, lightinfo)
+            prof_name = self.profile_name if self.profile_name else self.tr("custom_profile")
+            lightinfo.attrib["name"] = prof_name
+
+            # Синхронизация блока keyinfo
             keyinfo = root_elem.find("keyinfo")
-            if keyinfo is not None:
-                for item in keyinfo.findall("item"):
+            if keyinfo is None:
+                keyinfo = ET.SubElement(root_elem, "keyinfo")
+
+            existing_codes = set()
+            for item in keyinfo.findall("item"):
+                if "key_code" in item.attrib:
                     code = int(item.attrib["key_code"])
+                    existing_codes.add(code)
                     col_data = self.get_key_effective_color(code)
                     if col_data:
                         _, _, colorref_val = col_data
                         item.attrib["key_rgb"] = str(colorref_val)
 
-            self.xml_tree.write(file_path, encoding="UTF-8", xml_declaration=True)
+            # Добавляем клавиши, отсутствовавшие в исходном файле
+            for code in KEYBOARD_LAYOUT.keys():
+                if code not in existing_codes:
+                    col_data = self.get_key_effective_color(code)
+                    colorref_val = col_data[2] if col_data else 0
+                    ET.SubElement(keyinfo, "item", key_code=str(code), key_rgb=str(colorref_val))
+
+            # Построчное формирование XML по точному шаблону родной утилиты
+            profile_name_attr = lightinfo.attrib.get("name", "Custom Light").replace("&", "&amp;").replace('"', "&quot;")
+            lines = [
+                "<?xml version='1.0' encoding='UTF-8'?>",
+                "<userlight>",
+                f'<lightinfo name="{profile_name_attr}" />',
+                "<keyinfo>"
+            ]
+
+            for item in keyinfo.findall("item"):
+                k_code = item.attrib.get("key_code", "")
+                k_rgb = item.attrib.get("key_rgb", "0")
+                lines.append(f'<item key_code="{k_code}" key_rgb="{k_rgb}" />')
+
+            lines.append("</keyinfo>")
+            lines.append("</userlight>")
+            lines.append("")
+
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+
             messagebox.showinfo(self.tr("success"), self.tr("xml_saved", path=file_path))
         except Exception as e:
             messagebox.showerror(self.tr("error"), self.tr("xml_export_error", error=e))
 
 
 if __name__ == "__main__":
-    # Явная регистрация уникального AppUserModelID для Windows (для иконки на панели задач)
+    # Регистрация AppUserModelID для отображения иконки в Windows
     try:
         myappid = "galaxy70.customizer.gui.1.0"
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
@@ -1462,7 +2047,6 @@ if __name__ == "__main__":
 
     root = tk.Tk()
 
-    # Установка иконки для окна и всех диалоговых окон процесса
     icon_file = resource_path("icon.ico")
     if os.path.exists(icon_file):
         try:
