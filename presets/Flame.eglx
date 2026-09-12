@@ -1,0 +1,808 @@
+{
+  "format": "Galaxy70EditorProject",
+  "version": 1,
+  "window": {
+    "geometry": "1475x625+338+338"
+  },
+  "profile": {
+    "label": "Profile: Orange Gradient (Filtered)",
+    "xml": "<userlight>\n<lightinfo name=\"Orange Gradient (Filtered)\" />\n<keyinfo>\n<item key_code=\"41\" key_rgb=\"3277055\" />\n<item key_code=\"58\" key_rgb=\"393471\" />\n<item key_code=\"59\" key_rgb=\"5631\" />\n<item key_code=\"60\" key_rgb=\"12543\" />\n<item key_code=\"61\" key_rgb=\"19455\" />\n<item key_code=\"62\" key_rgb=\"27903\" />\n<item key_code=\"63\" key_rgb=\"32255\" />\n<item key_code=\"64\" key_rgb=\"34047\" />\n<item key_code=\"65\" key_rgb=\"32767\" />\n<item key_code=\"66\" key_rgb=\"26623\" />\n<item key_code=\"67\" key_rgb=\"21247\" />\n<item key_code=\"68\" key_rgb=\"14591\" />\n<item key_code=\"69\" key_rgb=\"7423\" />\n<item key_code=\"70\" key_rgb=\"917759\" />\n<item key_code=\"53\" key_rgb=\"2687231\" />\n<item key_code=\"30\" key_rgb=\"721151\" />\n<item key_code=\"31\" key_rgb=\"4863\" />\n<item key_code=\"32\" key_rgb=\"12543\" />\n<item key_code=\"33\" key_rgb=\"20479\" />\n<item key_code=\"34\" key_rgb=\"27391\" />\n<item key_code=\"35\" key_rgb=\"34559\" />\n<item key_code=\"36\" key_rgb=\"40703\" />\n<item key_code=\"37\" key_rgb=\"43775\" />\n<item key_code=\"38\" key_rgb=\"41727\" />\n<item key_code=\"39\" key_rgb=\"36095\" />\n<item key_code=\"45\" key_rgb=\"29183\" />\n<item key_code=\"46\" key_rgb=\"22271\" />\n<item key_code=\"42\" key_rgb=\"10751\" />\n<item key_code=\"74\" key_rgb=\"721151\" />\n<item key_code=\"75\" key_rgb=\"2687231\" />\n<item key_code=\"43\" key_rgb=\"1966335\" />\n<item key_code=\"20\" key_rgb=\"2047\" />\n<item key_code=\"26\" key_rgb=\"9983\" />\n<item key_code=\"8\" key_rgb=\"18175\" />\n<item key_code=\"21\" key_rgb=\"25855\" />\n<item key_code=\"23\" key_rgb=\"33535\" />\n<item key_code=\"28\" key_rgb=\"41471\" />\n<item key_code=\"24\" key_rgb=\"48895\" />\n<item key_code=\"12\" key_rgb=\"50175\" />\n<item key_code=\"18\" key_rgb=\"43519\" />\n<item key_code=\"19\" key_rgb=\"35583\" />\n<item key_code=\"47\" key_rgb=\"27647\" />\n<item key_code=\"48\" key_rgb=\"20223\" />\n<item key_code=\"49\" key_rgb=\"9983\" />\n<item key_code=\"76\" key_rgb=\"459007\" />\n<item key_code=\"78\" key_rgb=\"2490623\" />\n<item key_code=\"57\" key_rgb=\"1769727\" />\n<item key_code=\"4\" key_rgb=\"4095\" />\n<item key_code=\"22\" key_rgb=\"11775\" />\n<item key_code=\"7\" key_rgb=\"19967\" />\n<item key_code=\"9\" key_rgb=\"27391\" />\n<item key_code=\"10\" key_rgb=\"35071\" />\n<item key_code=\"11\" key_rgb=\"43007\" />\n<item key_code=\"13\" key_rgb=\"48895\" />\n<item key_code=\"14\" key_rgb=\"47871\" />\n<item key_code=\"15\" key_rgb=\"41215\" />\n<item key_code=\"51\" key_rgb=\"33279\" />\n<item key_code=\"52\" key_rgb=\"25599\" />\n<item key_code=\"40\" key_rgb=\"13055\" />\n<item key_code=\"225\" key_rgb=\"1507583\" />\n<item key_code=\"29\" key_rgb=\"6399\" />\n<item key_code=\"27\" key_rgb=\"14335\" />\n<item key_code=\"6\" key_rgb=\"21759\" />\n<item key_code=\"25\" key_rgb=\"28671\" />\n<item key_code=\"5\" key_rgb=\"35071\" />\n<item key_code=\"17\" key_rgb=\"40447\" />\n<item key_code=\"16\" key_rgb=\"42239\" />\n<item key_code=\"54\" key_rgb=\"39423\" />\n<item key_code=\"55\" key_rgb=\"33535\" />\n<item key_code=\"56\" key_rgb=\"26879\" />\n<item key_code=\"229\" key_rgb=\"13311\" />\n<item key_code=\"82\" key_rgb=\"786687\" />\n<item key_code=\"224\" key_rgb=\"3014911\" />\n<item key_code=\"227\" key_rgb=\"655615\" />\n<item key_code=\"226\" key_rgb=\"6399\" />\n<item key_code=\"44\" key_rgb=\"29695\" />\n<item key_code=\"230\" key_rgb=\"28671\" />\n<item key_code=\"175\" key_rgb=\"22015\" />\n<item key_code=\"228\" key_rgb=\"13823\" />\n<item key_code=\"80\" key_rgb=\"2047\" />\n<item key_code=\"81\" key_rgb=\"1376511\" />\n<item key_code=\"79\" key_rgb=\"3277055\" />\n</keyinfo>\n</userlight>"
+  },
+  "colors": {
+    "base": {
+      "41": {
+        "hex": "#ff0032",
+        "rgb": [
+          255,
+          0,
+          50
+        ],
+        "raw": 3277055
+      },
+      "58": {
+        "hex": "#ff0006",
+        "rgb": [
+          255,
+          0,
+          6
+        ],
+        "raw": 393471
+      },
+      "59": {
+        "hex": "#ff1500",
+        "rgb": [
+          255,
+          21,
+          0
+        ],
+        "raw": 5631
+      },
+      "60": {
+        "hex": "#ff3000",
+        "rgb": [
+          255,
+          48,
+          0
+        ],
+        "raw": 12543
+      },
+      "61": {
+        "hex": "#ff4b00",
+        "rgb": [
+          255,
+          75,
+          0
+        ],
+        "raw": 19455
+      },
+      "62": {
+        "hex": "#ff6c00",
+        "rgb": [
+          255,
+          108,
+          0
+        ],
+        "raw": 27903
+      },
+      "63": {
+        "hex": "#ff7d00",
+        "rgb": [
+          255,
+          125,
+          0
+        ],
+        "raw": 32255
+      },
+      "64": {
+        "hex": "#ff8400",
+        "rgb": [
+          255,
+          132,
+          0
+        ],
+        "raw": 34047
+      },
+      "65": {
+        "hex": "#ff7f00",
+        "rgb": [
+          255,
+          127,
+          0
+        ],
+        "raw": 32767
+      },
+      "66": {
+        "hex": "#ff6700",
+        "rgb": [
+          255,
+          103,
+          0
+        ],
+        "raw": 26623
+      },
+      "67": {
+        "hex": "#ff5200",
+        "rgb": [
+          255,
+          82,
+          0
+        ],
+        "raw": 21247
+      },
+      "68": {
+        "hex": "#ff3800",
+        "rgb": [
+          255,
+          56,
+          0
+        ],
+        "raw": 14591
+      },
+      "69": {
+        "hex": "#ff1c00",
+        "rgb": [
+          255,
+          28,
+          0
+        ],
+        "raw": 7423
+      },
+      "70": {
+        "hex": "#ff000e",
+        "rgb": [
+          255,
+          0,
+          14
+        ],
+        "raw": 917759
+      },
+      "53": {
+        "hex": "#ff0029",
+        "rgb": [
+          255,
+          0,
+          41
+        ],
+        "raw": 2687231
+      },
+      "30": {
+        "hex": "#ff000b",
+        "rgb": [
+          255,
+          0,
+          11
+        ],
+        "raw": 721151
+      },
+      "31": {
+        "hex": "#ff1200",
+        "rgb": [
+          255,
+          18,
+          0
+        ],
+        "raw": 4863
+      },
+      "32": {
+        "hex": "#ff3000",
+        "rgb": [
+          255,
+          48,
+          0
+        ],
+        "raw": 12543
+      },
+      "33": {
+        "hex": "#ff4f00",
+        "rgb": [
+          255,
+          79,
+          0
+        ],
+        "raw": 20479
+      },
+      "34": {
+        "hex": "#ff6a00",
+        "rgb": [
+          255,
+          106,
+          0
+        ],
+        "raw": 27391
+      },
+      "35": {
+        "hex": "#ff8600",
+        "rgb": [
+          255,
+          134,
+          0
+        ],
+        "raw": 34559
+      },
+      "36": {
+        "hex": "#ff9e00",
+        "rgb": [
+          255,
+          158,
+          0
+        ],
+        "raw": 40703
+      },
+      "37": {
+        "hex": "#ffaa00",
+        "rgb": [
+          255,
+          170,
+          0
+        ],
+        "raw": 43775
+      },
+      "38": {
+        "hex": "#ffa200",
+        "rgb": [
+          255,
+          162,
+          0
+        ],
+        "raw": 41727
+      },
+      "39": {
+        "hex": "#ff8c00",
+        "rgb": [
+          255,
+          140,
+          0
+        ],
+        "raw": 36095
+      },
+      "45": {
+        "hex": "#ff7100",
+        "rgb": [
+          255,
+          113,
+          0
+        ],
+        "raw": 29183
+      },
+      "46": {
+        "hex": "#ff5600",
+        "rgb": [
+          255,
+          86,
+          0
+        ],
+        "raw": 22271
+      },
+      "42": {
+        "hex": "#ff2900",
+        "rgb": [
+          255,
+          41,
+          0
+        ],
+        "raw": 10751
+      },
+      "74": {
+        "hex": "#ff000b",
+        "rgb": [
+          255,
+          0,
+          11
+        ],
+        "raw": 721151
+      },
+      "75": {
+        "hex": "#ff0029",
+        "rgb": [
+          255,
+          0,
+          41
+        ],
+        "raw": 2687231
+      },
+      "43": {
+        "hex": "#ff001e",
+        "rgb": [
+          255,
+          0,
+          30
+        ],
+        "raw": 1966335
+      },
+      "20": {
+        "hex": "#ff0700",
+        "rgb": [
+          255,
+          7,
+          0
+        ],
+        "raw": 2047
+      },
+      "26": {
+        "hex": "#ff2600",
+        "rgb": [
+          255,
+          38,
+          0
+        ],
+        "raw": 9983
+      },
+      "8": {
+        "hex": "#ff4600",
+        "rgb": [
+          255,
+          70,
+          0
+        ],
+        "raw": 18175
+      },
+      "21": {
+        "hex": "#ff6400",
+        "rgb": [
+          255,
+          100,
+          0
+        ],
+        "raw": 25855
+      },
+      "23": {
+        "hex": "#ff8200",
+        "rgb": [
+          255,
+          130,
+          0
+        ],
+        "raw": 33535
+      },
+      "28": {
+        "hex": "#ffa100",
+        "rgb": [
+          255,
+          161,
+          0
+        ],
+        "raw": 41471
+      },
+      "24": {
+        "hex": "#ffbe00",
+        "rgb": [
+          255,
+          190,
+          0
+        ],
+        "raw": 48895
+      },
+      "12": {
+        "hex": "#ffc300",
+        "rgb": [
+          255,
+          195,
+          0
+        ],
+        "raw": 50175
+      },
+      "18": {
+        "hex": "#ffa900",
+        "rgb": [
+          255,
+          169,
+          0
+        ],
+        "raw": 43519
+      },
+      "19": {
+        "hex": "#ff8a00",
+        "rgb": [
+          255,
+          138,
+          0
+        ],
+        "raw": 35583
+      },
+      "47": {
+        "hex": "#ff6b00",
+        "rgb": [
+          255,
+          107,
+          0
+        ],
+        "raw": 27647
+      },
+      "48": {
+        "hex": "#ff4e00",
+        "rgb": [
+          255,
+          78,
+          0
+        ],
+        "raw": 20223
+      },
+      "49": {
+        "hex": "#ff2600",
+        "rgb": [
+          255,
+          38,
+          0
+        ],
+        "raw": 9983
+      },
+      "76": {
+        "hex": "#ff0007",
+        "rgb": [
+          255,
+          0,
+          7
+        ],
+        "raw": 459007
+      },
+      "78": {
+        "hex": "#ff0026",
+        "rgb": [
+          255,
+          0,
+          38
+        ],
+        "raw": 2490623
+      },
+      "57": {
+        "hex": "#ff001b",
+        "rgb": [
+          255,
+          0,
+          27
+        ],
+        "raw": 1769727
+      },
+      "4": {
+        "hex": "#ff0f00",
+        "rgb": [
+          255,
+          15,
+          0
+        ],
+        "raw": 4095
+      },
+      "22": {
+        "hex": "#ff2d00",
+        "rgb": [
+          255,
+          45,
+          0
+        ],
+        "raw": 11775
+      },
+      "7": {
+        "hex": "#ff4d00",
+        "rgb": [
+          255,
+          77,
+          0
+        ],
+        "raw": 19967
+      },
+      "9": {
+        "hex": "#ff6a00",
+        "rgb": [
+          255,
+          106,
+          0
+        ],
+        "raw": 27391
+      },
+      "10": {
+        "hex": "#ff8800",
+        "rgb": [
+          255,
+          136,
+          0
+        ],
+        "raw": 35071
+      },
+      "11": {
+        "hex": "#ffa700",
+        "rgb": [
+          255,
+          167,
+          0
+        ],
+        "raw": 43007
+      },
+      "13": {
+        "hex": "#ffbe00",
+        "rgb": [
+          255,
+          190,
+          0
+        ],
+        "raw": 48895
+      },
+      "14": {
+        "hex": "#ffba00",
+        "rgb": [
+          255,
+          186,
+          0
+        ],
+        "raw": 47871
+      },
+      "15": {
+        "hex": "#ffa000",
+        "rgb": [
+          255,
+          160,
+          0
+        ],
+        "raw": 41215
+      },
+      "51": {
+        "hex": "#ff8100",
+        "rgb": [
+          255,
+          129,
+          0
+        ],
+        "raw": 33279
+      },
+      "52": {
+        "hex": "#ff6300",
+        "rgb": [
+          255,
+          99,
+          0
+        ],
+        "raw": 25599
+      },
+      "40": {
+        "hex": "#ff3200",
+        "rgb": [
+          255,
+          50,
+          0
+        ],
+        "raw": 13055
+      },
+      "225": {
+        "hex": "#ff0017",
+        "rgb": [
+          255,
+          0,
+          23
+        ],
+        "raw": 1507583
+      },
+      "29": {
+        "hex": "#ff1800",
+        "rgb": [
+          255,
+          24,
+          0
+        ],
+        "raw": 6399
+      },
+      "27": {
+        "hex": "#ff3700",
+        "rgb": [
+          255,
+          55,
+          0
+        ],
+        "raw": 14335
+      },
+      "6": {
+        "hex": "#ff5400",
+        "rgb": [
+          255,
+          84,
+          0
+        ],
+        "raw": 21759
+      },
+      "25": {
+        "hex": "#ff6f00",
+        "rgb": [
+          255,
+          111,
+          0
+        ],
+        "raw": 28671
+      },
+      "5": {
+        "hex": "#ff8800",
+        "rgb": [
+          255,
+          136,
+          0
+        ],
+        "raw": 35071
+      },
+      "17": {
+        "hex": "#ff9d00",
+        "rgb": [
+          255,
+          157,
+          0
+        ],
+        "raw": 40447
+      },
+      "16": {
+        "hex": "#ffa400",
+        "rgb": [
+          255,
+          164,
+          0
+        ],
+        "raw": 42239
+      },
+      "54": {
+        "hex": "#ff9900",
+        "rgb": [
+          255,
+          153,
+          0
+        ],
+        "raw": 39423
+      },
+      "55": {
+        "hex": "#ff8200",
+        "rgb": [
+          255,
+          130,
+          0
+        ],
+        "raw": 33535
+      },
+      "56": {
+        "hex": "#ff6800",
+        "rgb": [
+          255,
+          104,
+          0
+        ],
+        "raw": 26879
+      },
+      "229": {
+        "hex": "#ff3300",
+        "rgb": [
+          255,
+          51,
+          0
+        ],
+        "raw": 13311
+      },
+      "82": {
+        "hex": "#ff000c",
+        "rgb": [
+          255,
+          0,
+          12
+        ],
+        "raw": 786687
+      },
+      "224": {
+        "hex": "#ff002e",
+        "rgb": [
+          255,
+          0,
+          46
+        ],
+        "raw": 3014911
+      },
+      "227": {
+        "hex": "#ff000a",
+        "rgb": [
+          255,
+          0,
+          10
+        ],
+        "raw": 655615
+      },
+      "226": {
+        "hex": "#ff1800",
+        "rgb": [
+          255,
+          24,
+          0
+        ],
+        "raw": 6399
+      },
+      "44": {
+        "hex": "#ff7300",
+        "rgb": [
+          255,
+          115,
+          0
+        ],
+        "raw": 29695
+      },
+      "230": {
+        "hex": "#ff6f00",
+        "rgb": [
+          255,
+          111,
+          0
+        ],
+        "raw": 28671
+      },
+      "175": {
+        "hex": "#ff5500",
+        "rgb": [
+          255,
+          85,
+          0
+        ],
+        "raw": 22015
+      },
+      "228": {
+        "hex": "#ff3500",
+        "rgb": [
+          255,
+          53,
+          0
+        ],
+        "raw": 13823
+      },
+      "80": {
+        "hex": "#ff0700",
+        "rgb": [
+          255,
+          7,
+          0
+        ],
+        "raw": 2047
+      },
+      "81": {
+        "hex": "#ff0015",
+        "rgb": [
+          255,
+          0,
+          21
+        ],
+        "raw": 1376511
+      },
+      "79": {
+        "hex": "#ff0032",
+        "rgb": [
+          255,
+          0,
+          50
+        ],
+        "raw": 3277055
+      }
+    },
+    "manual_overrides": {}
+  },
+  "selection": {
+    "selected_keys": [],
+    "base_selected_keys": [
+      15,
+      19,
+      51,
+      55,
+      56,
+      175,
+      230
+    ]
+  },
+  "gradient": {
+    "active": false,
+    "invert": false,
+    "contrast": 0,
+    "mode": "horizontal",
+    "method": "hsv",
+    "start_rgb": [
+      225,
+      9,
+      9
+    ],
+    "end_rgb": [
+      14,
+      37,
+      78
+    ],
+    "active_target": "end",
+    "picker": {
+      "hue": 0.6067708333333334,
+      "sat": 0.8205128205128205,
+      "val": 0.3058823529411765
+    },
+    "hex": "#0E254E"
+  },
+  "color_correction": {
+    "active": false,
+    "hue": 0,
+    "saturation": 0,
+    "value": 0
+  },
+  "manual_picker": {
+    "picker": {
+      "hue": 0.0,
+      "sat": 0.9571428571428572,
+      "val": 0.95
+    },
+    "hex": "#F20A0A"
+  },
+  "ui": {
+    "active_tab": "cc"
+  },
+  "preset_name": "Flame"
+}
