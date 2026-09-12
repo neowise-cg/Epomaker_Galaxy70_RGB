@@ -5,9 +5,29 @@ import json
 import os
 import sys
 import ctypes
+from ctypes import wintypes
 import threading
+import re
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
+
+# winreg доступен только на Windows — как и остальной WinAPI-функционал этой
+# программы (HID-транспорт использует ctypes.WinDLL). На других платформах
+# просто отключаем связанную с автозапуском функциональность.
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
+# Библиотеки для иконки в системном трее — опциональная зависимость.
+# Если не установлены (pip install pystray pillow), функции "свернуть в
+# трей" в настройках будут недоступны, но остальная программа работает как обычно.
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    TRAY_LIBS_AVAILABLE = True
+except ImportError:
+    TRAY_LIBS_AVAILABLE = False
 
 
 def resource_path(relative_path):
@@ -19,6 +39,331 @@ def resource_path(relative_path):
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
+
+
+def get_app_dir():
+    """Папка, где физически лежит .exe (PyInstaller) либо .py скрипт.
+
+    Используется для постоянного хранения пользовательских данных (пресетов),
+    в отличие от resource_path/_MEIPASS, который указывает на временную
+    распакованную папку и не годится для записи.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+PRESETS_DIR_NAME = "presets"
+
+
+def get_presets_dir():
+    """Возвращает (и при необходимости создаёт) папку presets рядом с программой."""
+    path = os.path.join(get_app_dir(), PRESETS_DIR_NAME)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def sanitize_filename(name):
+    """Убирает символы, недопустимые в именах файлов Windows/Linux."""
+    cleaned = re.sub(r'[\\/:*?"<>|]', "", name).strip()
+    cleaned = re.sub(r'\s+', " ", cleaned)
+    return cleaned or "preset"
+
+
+# ---------------------------------------------------------------------------
+# Настройки приложения (settings.json рядом с программой)
+# ---------------------------------------------------------------------------
+
+SETTINGS_FILE_NAME = "settings.json"
+
+DEFAULT_APP_SETTINGS = {
+    "start_minimized": False,
+    "minimize_on_close": False,
+    "hotkey_next_preset": None,   # {"vk": int, "scan": int, "ext": bool} либо None
+    "hotkey_prev_preset": None,
+}
+
+# Ключи настроек, значения которых — простые bool, а не структуры хоткеев.
+_BOOL_SETTING_KEYS = ("start_minimized", "minimize_on_close")
+_HOTKEY_SETTING_KEYS = ("hotkey_next_preset", "hotkey_prev_preset")
+
+
+def get_settings_path():
+    return os.path.join(get_app_dir(), SETTINGS_FILE_NAME)
+
+
+def _sanitize_hotkey_binding(value):
+    """Проверяет, что структура хоткея из settings.json корректна."""
+    if not isinstance(value, dict):
+        return None
+    try:
+        return {
+            "vk": int(value["vk"]),
+            "scan": int(value["scan"]),
+            "ext": bool(value.get("ext", False)),
+            "ctrl": bool(value.get("ctrl", False)),
+            "alt": bool(value.get("alt", False)),
+            "shift": bool(value.get("shift", False)),
+            "win": bool(value.get("win", False)),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def load_app_settings():
+    """Загружает настройки трея/сворачивания/хоткеев из settings.json (или значения по умолчанию)."""
+    settings = dict(DEFAULT_APP_SETTINGS)
+    try:
+        with open(get_settings_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            for key in _BOOL_SETTING_KEYS:
+                if key in data:
+                    settings[key] = bool(data[key])
+            for key in _HOTKEY_SETTING_KEYS:
+                if key in data:
+                    settings[key] = _sanitize_hotkey_binding(data[key])
+    except Exception:
+        pass
+    return settings
+
+
+def save_app_settings(settings):
+    try:
+        with open(get_settings_path(), "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Глобальный низкоуровневый хук клавиатуры (WH_KEYBOARD_LL) — используется
+# для горячих клавиш переключения пресетов (например, Fn+=/Fn+-).
+#
+# ВАЖНО: Windows в принципе не знает о клавише Fn — это чисто firmware-side
+# концепция самой клавиатуры. Если прошивка Galaxy 70 не переназначает Fn+=
+# на какой-то отдельный код, а просто пропускает голый скан-код "=" (как будто
+# Fn не нажимался), то отличить "просто =" от "Fn+=" программно невозможно —
+# в этом случае сработает ЛЮБОЕ нажатие "=", включая обычный набор текста.
+# (Именно так и оказалось на практике с Fn+=/Fn+- на Galaxy 70 — прошивка не
+# отличает их от голых "=" и "-".) Поэтому хоткеи строятся на обычных
+# модификаторах Ctrl/Alt/Shift/Win — они, в отличие от Fn, реально видны
+# Windows и корректно транслируются в события клавиатуры.
+# ---------------------------------------------------------------------------
+
+WH_KEYBOARD_LL = 13
+WM_KEYDOWN = 0x0100
+WM_SYSKEYDOWN = 0x0104
+WM_QUIT = 0x0012
+LLKHF_EXTENDED = 0x01
+
+VK_SHIFT, VK_CONTROL, VK_MENU = 0x10, 0x11, 0x12  # Alt = VK_MENU
+VK_LWIN, VK_RWIN = 0x5B, 0x5C
+
+# Все виртуальные коды, которые считаются "модификатором" и не могут сами по
+# себе быть основной клавишей хоткея (левые/правые Shift/Ctrl/Alt/Win).
+_MODIFIER_VKS = {0x10, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C}
+
+_LRESULT = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+
+# ctypes.WINFUNCTYPE (соглашение вызова stdcall) существует только на Windows.
+# Программа в любом случае Windows-only (см. Galaxy70HidTransport на ctypes.windll),
+# но эта проверка не даёт упасть при простом импорте/анализе модуля на другой ОС.
+if sys.platform == "win32":
+    _HOOKPROC = ctypes.WINFUNCTYPE(_LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+else:
+    _HOOKPROC = None
+
+
+class _KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", wintypes.DWORD),
+        ("scanCode", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", wintypes.WPARAM),
+    ]
+
+
+def _get_modifier_state():
+    """Текущее состояние Ctrl/Alt/Shift/Win через GetAsyncKeyState —
+    в отличие от Fn, эти модификаторы Windows видит по-настоящему."""
+    user32 = ctypes.windll.user32
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+    user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+
+    def is_down(vk):
+        return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+
+    return {
+        "ctrl": is_down(VK_CONTROL),
+        "alt": is_down(VK_MENU),
+        "shift": is_down(VK_SHIFT),
+        "win": is_down(VK_LWIN) or is_down(VK_RWIN),
+    }
+
+
+# Человекочитаемые названия для наиболее вероятных "основных" клавиш хоткея.
+_VK_NAMES = {
+    0xBB: "=", 0xBD: "-", 0x6B: "Num +", 0x6D: "Num -",
+    0xAE: "Volume Down", 0xAF: "Volume Up", 0xAD: "Volume Mute",
+    0xB0: "Media Next", 0xB1: "Media Prev", 0xB3: "Media Play/Pause",
+    0x21: "Page Up", 0x22: "Page Down", 0x24: "Home", 0x23: "End",
+    0x26: "Up", 0x28: "Down", 0x25: "Left", 0x27: "Right",
+    0x2D: "Insert", 0x2E: "Delete", 0x2C: "PrtScn", 0x91: "ScrollLock", 0x13: "Pause",
+}
+
+
+def hotkey_binding_to_label(binding):
+    if not binding:
+        return None
+    vk = binding.get("vk", 0)
+    parts = []
+    if binding.get("ctrl"):
+        parts.append("Ctrl")
+    if binding.get("alt"):
+        parts.append("Alt")
+    if binding.get("shift"):
+        parts.append("Shift")
+    if binding.get("win"):
+        parts.append("Win")
+    name = _VK_NAMES.get(vk)
+    parts.append(name if name else f"VK 0x{vk:02X}")
+    return "+".join(parts)
+
+
+def hotkey_bindings_equal(binding, vk, scan, ext, mods):
+    if not binding:
+        return False
+    return (
+        int(binding.get("vk", -1)) == vk
+        and bool(binding.get("ctrl", False)) == bool(mods.get("ctrl"))
+        and bool(binding.get("alt", False)) == bool(mods.get("alt"))
+        and bool(binding.get("shift", False)) == bool(mods.get("shift"))
+        and bool(binding.get("win", False)) == bool(mods.get("win"))
+    )
+
+
+class HotkeyManager:
+    """Держит низкоуровневый хук клавиатуры в отдельном потоке со своим
+    циклом сообщений (это требование WinAPI для WH_KEYBOARD_LL) и
+    пробрасывает каждое нажатие "основной" клавиши (не модификатора) вместе
+    с текущим состоянием Ctrl/Alt/Shift/Win в основной Tk-поток через root.after."""
+
+    def __init__(self, on_key_event):
+        self.on_key_event = on_key_event  # callback(vkCode, scanCode, extended, mods)
+        self._thread = None
+        self._thread_id = None
+        self._hook_id = None
+        self._hook_proc_ref = None  # держим ссылку, иначе GC соберёт колбэк
+        self._running = False
+
+    def start(self):
+        if sys.platform != "win32" or self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        if not self._running or self._thread_id is None:
+            return
+        try:
+            ctypes.windll.user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
+        except Exception:
+            pass
+
+    def _run(self):
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        user32.SetWindowsHookExW.restype = wintypes.HHOOK
+        user32.SetWindowsHookExW.argtypes = [ctypes.c_int, _HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
+        user32.CallNextHookEx.restype = _LRESULT
+        user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+        kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+        self._thread_id = kernel32.GetCurrentThreadId()
+
+        def low_level_handler(nCode, wParam, lParam):
+            if nCode == 0 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                kb = ctypes.cast(lParam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
+                vk = int(kb.vkCode)
+                # Модификатор сам по себе не может быть "основной" клавишей —
+                # ждём, пока вместе с ним нажмут что-то ещё.
+                if vk not in _MODIFIER_VKS:
+                    extended = bool(kb.flags & LLKHF_EXTENDED)
+                    scan = int(kb.scanCode)
+                    mods = _get_modifier_state()
+                    try:
+                        self.on_key_event(vk, scan, extended, mods)
+                    except Exception:
+                        pass
+            return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+        self._hook_proc_ref = _HOOKPROC(low_level_handler)
+        h_mod = kernel32.GetModuleHandleW(None)
+        self._hook_id = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._hook_proc_ref, h_mod, 0)
+
+        if not self._hook_id:
+            self._running = False
+            return
+
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+        user32.UnhookWindowsHookEx(self._hook_id)
+        self._hook_id = None
+        self._running = False
+
+
+# ---------------------------------------------------------------------------
+# Автозапуск при включении компьютера (HKCU\...\Run)
+# ---------------------------------------------------------------------------
+
+STARTUP_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_VALUE_NAME = "EpomakerGalaxy70Editor"
+
+
+def get_startup_command():
+    """Команда, которая будет прописана в реестре для автозапуска."""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    script_path = os.path.abspath(__file__)
+    return f'"{sys.executable}" "{script_path}"'
+
+
+def is_run_at_startup():
+    if winreg is None:
+        return False
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_PATH, 0, winreg.KEY_QUERY_VALUE)
+        try:
+            value, _ = winreg.QueryValueEx(key, STARTUP_VALUE_NAME)
+            return bool(value)
+        finally:
+            winreg.CloseKey(key)
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def set_run_at_startup(enable):
+    if winreg is None:
+        raise RuntimeError("winreg is unavailable on this platform")
+
+    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_PATH, 0, winreg.KEY_SET_VALUE)
+    try:
+        if enable:
+            winreg.SetValueEx(key, STARTUP_VALUE_NAME, 0, winreg.REG_SZ, get_startup_command())
+        else:
+            try:
+                winreg.DeleteValue(key, STARTUP_VALUE_NAME)
+            except FileNotFoundError:
+                pass
+    finally:
+        winreg.CloseKey(key)
 
 
 # Раскладка клавиш по стандартам USB HID Usage ID
@@ -650,6 +995,105 @@ class PhotoshopColorPicker(tk.Frame):
             self.on_color_change(self.get_hex())
 
 
+class RGBSliderPanel(tk.Frame):
+    """Три слайдера R/G/B с полями для точного ввода значений.
+
+    Числовое поле каждого канала закреплено в правом верхнем углу
+    над соответствующим слайдером и поддерживает ручной ввод значения
+    (0-255) с клавиатуры (Enter или потеря фокуса применяют значение).
+    """
+
+    CHANNELS = (("R", "#ff6b6b"), ("G", "#6bff8e"), ("B", "#6ba8ff"))
+
+    def __init__(self, parent, on_change_callback, length=220):
+        super().__init__(parent, bg="#25252b")
+        self.on_change = on_change_callback
+        self._suspend_events = False
+
+        self.vars = {}      # channel -> tk.IntVar (slider value)
+        self.entries = {}   # channel -> tk.Entry (numeric text)
+        self.scales = {}    # channel -> tk.Scale
+
+        for label_text, color in self.CHANNELS:
+            row = tk.Frame(self, bg="#25252b")
+            row.pack(fill=tk.X, pady=(4, 0))
+
+            top = tk.Frame(row, bg="#25252b")
+            top.pack(fill=tk.X)
+
+            tk.Label(
+                top, text=label_text, font=("Segoe UI", 9, "bold"),
+                bg="#25252b", fg=color, width=2, anchor="w"
+            ).pack(side=tk.LEFT)
+
+            entry = tk.Entry(
+                top, width=4, font=("Consolas", 9), bg="#1e1e24", fg="#ffffff",
+                insertbackground="white", relief=tk.FLAT, justify="right"
+            )
+            entry.insert(0, "0")
+            entry.pack(side=tk.RIGHT)
+            entry.bind("<Return>", lambda e, ch=label_text: self._on_entry_apply(ch))
+            entry.bind("<FocusOut>", lambda e, ch=label_text: self._on_entry_apply(ch))
+            self.entries[label_text] = entry
+
+            var = tk.IntVar(value=0)
+            scale = tk.Scale(
+                row, from_=0, to=255, orient=tk.HORIZONTAL, variable=var,
+                bg="#25252b", fg="#ffffff", troughcolor="#1e1e24",
+                highlightthickness=0, showvalue=False, length=length,
+                command=lambda val, ch=label_text: self._on_scale_change(ch, val)
+            )
+            scale.pack(fill=tk.X, pady=(0, 2))
+
+            self.vars[label_text] = var
+            self.scales[label_text] = scale
+
+    def _on_scale_change(self, channel, value):
+        if self._suspend_events:
+            return
+        value = int(float(value))
+        entry = self.entries[channel]
+        entry.delete(0, tk.END)
+        entry.insert(0, str(value))
+        self._fire_change()
+
+    def _on_entry_apply(self, channel):
+        entry = self.entries[channel]
+        text = entry.get().strip()
+        try:
+            value = int(text)
+        except ValueError:
+            value = self.vars[channel].get()
+        value = max(0, min(255, value))
+
+        entry.delete(0, tk.END)
+        entry.insert(0, str(value))
+
+        self._suspend_events = True
+        self.vars[channel].set(value)
+        self._suspend_events = False
+
+        self._fire_change()
+
+    def _fire_change(self):
+        if self.on_change:
+            self.on_change(*self.get_rgb())
+
+    def get_rgb(self):
+        return (self.vars["R"].get(), self.vars["G"].get(), self.vars["B"].get())
+
+    def set_rgb(self, r, g, b):
+        """Обновляет слайдеры и поля без вызова callback изменения."""
+        self._suspend_events = True
+        for channel, value in zip(("R", "G", "B"), (r, g, b)):
+            value = max(0, min(255, int(value)))
+            self.vars[channel].set(value)
+            entry = self.entries[channel]
+            entry.delete(0, tk.END)
+            entry.insert(0, str(value))
+        self._suspend_events = False
+
+
 def rgb_to_oklab(r, g, b):
     """Convert sRGB (0..255) to OKLab."""
     r, g, b = [x / 255.0 for x in (r, g, b)]
@@ -740,7 +1184,7 @@ def interpolate_gradient_color(c1, c2, t, method):
 
 LANG = {
     "ru": {
-        "title": "Galaxy 70 Customizer",
+        "title": "Galaxy 70 RGB Customizer v1.2",
         "import_xml": "Импорт XML",
         "export_xml": "Экспорт XML",
         "save_project": "Сохранить проект",
@@ -794,6 +1238,7 @@ LANG = {
         "xml_read_error": "Не удалось прочитать файл:\n{error}",
         "import_first": "Сначала импортируйте XML-файл!",
         "xml_saved": "Конфигурация сохранена:\n{path}",
+        "xml_saved_short": "Конфигурация сохранена: {path}",
         "xml_export_error": "Не удалось экспортировать файл:\n{error}",
         "custom_profile": "Custom Light",
         "profile": "Профиль: {name}",
@@ -801,9 +1246,40 @@ LANG = {
         "apply_rgb_sending": "Отправка RGB на клавиатуру…",
         "apply_rgb_success": "Подсветка применена к клавиатуре.",
         "apply_rgb_error": "Не удалось применить подсветку:\n{error}",
+        "presets_tab": "Пресеты",
+        "save_preset": "Сохранить пресет",
+        "preset_name_title": "Новый пресет",
+        "preset_name_prompt": "Введите название пресета:",
+        "preset_empty_name": "Название пресета не может быть пустым.",
+        "preset_exists_overwrite": "Пресет с названием «{name}» уже существует.\nПерезаписать его?",
+        "preset_saved": "Пресет «{name}» сохранён.",
+        "preset_save_error": "Не удалось сохранить пресет:\n{error}",
+        "preset_apply_error": "Не удалось применить пресет:\n{error}",
+        "preset_delete_confirm": "Удалить пресет «{name}»?",
+        "preset_delete_error": "Не удалось удалить пресет:\n{error}",
+        "no_presets": "Пока нет сохранённых пресетов",
+        "preset_applied": "Пресет «{name}» применён.",
+        "settings_title": "Настройки",
+        "setting_run_at_startup": "Запускать при включении компьютера",
+        "setting_start_minimized": "Запускать свёрнутой в трей",
+        "setting_minimize_on_close": "При закрытии сворачивать в трей",
+        "startup_unsupported": "Автозапуск поддерживается только в Windows-сборке.",
+        "startup_error": "Не удалось изменить автозапуск:\n{error}",
+        "tray_unavailable": "Для работы с системным треем не хватает библиотек.\nУстановите их командой: pip install pystray pillow",
+        "tray_libs_missing_note": "Для сворачивания в трей нужны библиотеки pystray и Pillow (pip install pystray pillow).",
+        "close": "Закрыть",
+        "hotkeys_section_title": "Горячие клавиши переключения пресетов",
+        "hotkey_next_label": "Пресет вперёд:",
+        "hotkey_prev_label": "Пресет назад:",
+        "hotkey_record": "Записать",
+        "hotkey_not_set": "Не задано",
+        "hotkey_press_now": "Нажмите клавиши…",
+        "hotkey_note": "Fn на этой клавиатуре не видна Windows — комбинации с Fn (например Fn+=) неотличимы от обычного нажатия клавиши. Записывайте сочетания с Ctrl/Alt/Shift/Win — они распознаются корректно.",
+        "advanced_collapsed": "Дополнительно  ▶",
+        "advanced_expanded": "Дополнительно  ▼",
     },
     "en": {
-        "title": "Galaxy 70 Customizer",
+        "title": "Galaxy 70 RGB Customizer v1.2",
         "import_xml": "Import XML",
         "export_xml": "Export XML",
         "save_project": "Save Project",
@@ -857,6 +1333,7 @@ LANG = {
         "xml_read_error": "Could not read file:\n{error}",
         "import_first": "Import an XML file first!",
         "xml_saved": "Configuration saved:\n{path}",
+        "xml_saved_short": "Configuration saved: {path}",
         "xml_export_error": "Could not export file:\n{error}",
         "custom_profile": "Custom Light",
         "profile": "Profile: {name}",
@@ -864,6 +1341,37 @@ LANG = {
         "apply_rgb_sending": "Sending RGB to keyboard…",
         "apply_rgb_success": "RGB lighting applied to the keyboard.",
         "apply_rgb_error": "Could not apply RGB lighting:\n{error}",
+        "presets_tab": "Presets",
+        "save_preset": "Save Preset",
+        "preset_name_title": "New Preset",
+        "preset_name_prompt": "Enter preset name:",
+        "preset_empty_name": "Preset name cannot be empty.",
+        "preset_exists_overwrite": "A preset named \"{name}\" already exists.\nOverwrite it?",
+        "preset_saved": "Preset \"{name}\" saved.",
+        "preset_save_error": "Could not save preset:\n{error}",
+        "preset_apply_error": "Could not apply preset:\n{error}",
+        "preset_delete_confirm": "Delete preset \"{name}\"?",
+        "preset_delete_error": "Could not delete preset:\n{error}",
+        "no_presets": "No presets saved yet",
+        "preset_applied": "Preset \"{name}\" applied.",
+        "settings_title": "Settings",
+        "setting_run_at_startup": "Run at Windows startup",
+        "setting_start_minimized": "Start minimized to tray",
+        "setting_minimize_on_close": "Minimize to tray on close",
+        "startup_unsupported": "Run-at-startup is only supported in the Windows build.",
+        "startup_error": "Could not update startup setting:\n{error}",
+        "tray_unavailable": "The system tray libraries are missing.\nInstall them with: pip install pystray pillow",
+        "tray_libs_missing_note": "Minimizing to tray requires the pystray and Pillow libraries (pip install pystray pillow).",
+        "close": "Close",
+        "hotkeys_section_title": "Preset switching hotkeys",
+        "hotkey_next_label": "Next preset:",
+        "hotkey_prev_label": "Previous preset:",
+        "hotkey_record": "Record",
+        "hotkey_not_set": "Not set",
+        "hotkey_press_now": "Press keys…",
+        "hotkey_note": "Fn on this keyboard is invisible to Windows — Fn combos (e.g. Fn+=) are indistinguishable from the plain key. Record combos with Ctrl/Alt/Shift/Win instead — those are recognized correctly.",
+        "advanced_collapsed": "Advanced  ▶",
+        "advanced_expanded": "Advanced  ▼",
     }
 }
 
@@ -903,11 +1411,38 @@ class KeyboardVisualizerApp:
         self.drag_start = None
         self.selection_rect_id = None
 
+        # Панель пресетов
+        self.presets_panel_visible = False
+        self.preset_widgets = []  # список Frame-строк с кнопками пресетов (для очистки)
+
+        # Настройки приложения (автозапуск / трей)
+        self.settings = load_app_settings()
+        self.tray_icon = None
+        self._settings_win = None
+
+        # Глобальные хоткеи переключения пресетов
+        self._last_applied_preset_path = None
+        self._hotkey_capture_target = None  # "next" | "prev" | None
+        self._hotkey_capture_widgets = None  # (label_widget, record_button) активной записи
+        self.hotkey_manager = HotkeyManager(self._on_global_key_event)
+
         self.setup_ui()
 
         # Горячие клавиши проекта
         self.root.bind("<Control-s>", lambda e: self.save_project())
         self.root.bind("<Control-o>", lambda e: self.open_project())
+
+        # Закрытие окна: либо сворачиваем в трей, либо выходим — в зависимости от настройки.
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close_request)
+
+        # Хук клавиатуры должен работать и когда окно свёрнуто/скрыто в трей,
+        # поэтому запускаем его сразу при старте, а не только пока открыт диалог настроек.
+        self.hotkey_manager.start()
+
+        # Если включено "Запускать свёрнутой в трей" — сразу прячем окно и
+        # показываем иконку в трее вместо обычного показа окна.
+        if self.settings.get("start_minimized") and TRAY_LIBS_AVAILABLE:
+            self.root.after(0, self._start_minimized_to_tray)
 
     def tr(self, key, **kwargs):
         text = LANG[self.lang][key]
@@ -1043,6 +1578,22 @@ class KeyboardVisualizerApp:
         )
         self.btn_open_project.pack(side=tk.LEFT, padx=(8, 0))
 
+        # Кнопка настроек — крайняя правая кнопка окна (правее "Пресеты").
+        self.btn_settings = tk.Button(
+            top_frame, text="⚙", command=self.open_settings_dialog,
+            font=("Segoe UI Symbol", 13, "bold"), bg="#343a40", fg="white",
+            relief=tk.FLAT, width=2, cursor="hand2"
+        )
+        self.btn_settings.pack(side=tk.RIGHT, padx=(8, 0))
+
+        # Кнопка переключения панели пресетов — сразу слева от кнопки настроек.
+        self.btn_toggle_presets = tk.Button(
+            top_frame, text=self.tr("presets_tab"), command=self.toggle_presets_panel,
+            font=("Segoe UI", 10, "bold"), bg="#343a40", fg="white",
+            relief=tk.FLAT, padx=12, pady=5, cursor="hand2"
+        )
+        self.btn_toggle_presets.pack(side=tk.RIGHT)
+
         self.lbl_profile = tk.Label(
             top_frame, text=self.tr("profile_not_loaded"),
             font=("Segoe UI", 11), bg="#1e1e24", fg="#cccccc", padx=15
@@ -1074,6 +1625,7 @@ class KeyboardVisualizerApp:
 
         main_container = tk.Frame(self.root, bg="#1e1e24")
         main_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 15))
+        self.main_container = main_container
 
         self.keyboard_area = tk.Frame(main_container, bg="#1e1e24")
         self.keyboard_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -1141,8 +1693,74 @@ class KeyboardVisualizerApp:
         self.build_grad_tab()
         self.build_cc_tab()
 
+        self.build_presets_panel()
+
         self.switch_tab(getattr(self, "active_tab", "manual"))
         self.render_keyboard()
+
+    def build_presets_panel(self):
+        """Создаёт (но не показывает) выдвижную панель пресетов справа от side_panel."""
+        self.PRESETS_PANEL_WIDTH = 240
+        self.PRESETS_PANEL_PADX = 15
+
+        self.presets_panel = tk.Frame(
+            self.main_container, bg="#25252b", width=self.PRESETS_PANEL_WIDTH,
+            highlightthickness=1, highlightbackground="#333338"
+        )
+        self.presets_panel.pack_propagate(False)
+
+        header = tk.Frame(self.presets_panel, bg="#1e1e24")
+        header.pack(fill=tk.X)
+        self.lbl_presets_title = tk.Label(
+            header, text=self.tr("presets_tab"), font=("Segoe UI", 9, "bold"),
+            bg="#1e1e24", fg="#ffffff"
+        )
+        self.lbl_presets_title.pack(side=tk.LEFT, padx=10, pady=6)
+
+        self.btn_save_preset = tk.Button(
+            self.presets_panel, text=self.tr("save_preset"), command=self.save_preset,
+            font=("Segoe UI", 9, "bold"), bg="#6f42c1", fg="white",
+            relief=tk.FLAT, pady=6, cursor="hand2"
+        )
+        self.btn_save_preset.pack(fill=tk.X, padx=10, pady=(10, 6))
+
+        list_container = tk.Frame(self.presets_panel, bg="#25252b")
+        list_container.pack(fill=tk.BOTH, expand=True, padx=(10, 0), pady=(0, 10))
+
+        self.presets_canvas = tk.Canvas(list_container, bg="#25252b", highlightthickness=0)
+        presets_scrollbar = tk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.presets_canvas.yview)
+        self.presets_list_frame = tk.Frame(self.presets_canvas, bg="#25252b")
+
+        self.presets_list_frame.bind(
+            "<Configure>",
+            lambda e: self.presets_canvas.configure(scrollregion=self.presets_canvas.bbox("all"))
+        )
+        self._presets_canvas_window = self.presets_canvas.create_window((0, 0), window=self.presets_list_frame, anchor="nw")
+        self.presets_canvas.configure(yscrollcommand=presets_scrollbar.set)
+        self.presets_canvas.bind(
+            "<Configure>",
+            lambda e: self.presets_canvas.itemconfig(self._presets_canvas_window, width=e.width)
+        )
+
+        self.presets_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        presets_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10))
+
+        def _on_mousewheel(event):
+            delta = int(-1 * (event.delta / 120)) if event.delta else (1 if event.num == 5 else -1)
+            self.presets_canvas.yview_scroll(delta, "units")
+
+        def _bind_wheel(_e):
+            self.presets_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            self.presets_canvas.bind_all("<Button-4>", _on_mousewheel)
+            self.presets_canvas.bind_all("<Button-5>", _on_mousewheel)
+
+        def _unbind_wheel(_e):
+            self.presets_canvas.unbind_all("<MouseWheel>")
+            self.presets_canvas.unbind_all("<Button-4>")
+            self.presets_canvas.unbind_all("<Button-5>")
+
+        self.presets_canvas.bind("<Enter>", _bind_wheel)
+        self.presets_canvas.bind("<Leave>", _unbind_wheel)
 
     def switch_tab(self, tab_name):
         self.active_tab = tab_name
@@ -1164,12 +1782,58 @@ class KeyboardVisualizerApp:
             self.frame_cc.pack(fill=tk.BOTH, expand=True, padx=15, pady=10)
             self.btn_tab_cc.config(bg="#25252b", fg="#ffffff")
 
+    RGB_SPOILER_EXTRA_HEIGHT = 150
+
+    def _build_rgb_spoiler(self, parent, on_change_callback):
+        """Строит сворачиваемый блок "Дополнительно >" с RGB-слайдерами внутри.
+        По умолчанию свёрнут (чтобы не занимать место); при раскрытии окно
+        программы увеличивается по высоте на RGB_SPOILER_EXTRA_HEIGHT, чтобы
+        слайдеры не обрезались и не приходилось растягивать окно вручную —
+        при сворачивании окно уменьшается обратно."""
+        state = {"expanded": False}
+
+        header = tk.Frame(parent, bg="#25252b")
+        header.pack(fill=tk.X, pady=(2, 0))
+
+        btn_toggle = tk.Button(
+            header, text=self.tr("advanced_collapsed"), font=("Segoe UI", 9),
+            bg="#25252b", fg="#8a8a92", relief=tk.FLAT, anchor="w", padx=0,
+            cursor="hand2", bd=0, activebackground="#25252b", activeforeground="#cccccc"
+        )
+        btn_toggle.pack(side=tk.LEFT)
+
+        content = tk.Frame(parent, bg="#25252b")
+        # Не паковится сразу — блок стартует свёрнутым.
+
+        sliders = RGBSliderPanel(content, on_change_callback)
+        sliders.pack(anchor="w", fill=tk.X, pady=(4, 4))
+
+        def toggle():
+            if state["expanded"]:
+                content.pack_forget()
+                state["expanded"] = False
+                btn_toggle.config(text=self.tr("advanced_collapsed"))
+                self._resize_window_by(delta_h=-self.RGB_SPOILER_EXTRA_HEIGHT)
+            else:
+                content.pack(fill=tk.X, after=header)
+                state["expanded"] = True
+                btn_toggle.config(text=self.tr("advanced_expanded"))
+                self._resize_window_by(delta_h=self.RGB_SPOILER_EXTRA_HEIGHT)
+
+        btn_toggle.config(command=toggle)
+
+        return sliders
+
     def build_manual_tab(self):
         lbl_title = tk.Label(self.frame_manual, text=self.tr("color_palette"), font=("Segoe UI", 11, "bold"), bg="#25252b", fg="#ffffff")
         lbl_title.pack(anchor="w", pady=(0, 5))
 
         self.picker = PhotoshopColorPicker(self.frame_manual, self.on_picker_color_change)
         self.picker.pack(anchor="w", pady=5)
+
+        self.rgb_sliders = self._build_rgb_spoiler(self.frame_manual, self.on_rgb_sliders_change)
+        # Инициализируем слайдеры текущим цветом палитры (по умолчанию красный).
+        self.rgb_sliders.set_rgb(*self.picker.get_rgb())
 
         hex_frame = tk.Frame(self.frame_manual, bg="#25252b")
         hex_frame.pack(fill=tk.X, pady=10)
@@ -1288,6 +1952,9 @@ class KeyboardVisualizerApp:
         self.grad_picker = PhotoshopColorPicker(self.frame_grad, self.on_grad_picker_color_change)
         self.grad_picker.pack(anchor="w", pady=(5, 2))
 
+        self.grad_rgb_sliders = self._build_rgb_spoiler(self.frame_grad, self.on_grad_rgb_sliders_change)
+        self.grad_rgb_sliders.set_rgb(*self.grad_picker.get_rgb())
+
         grad_hex_frame = tk.Frame(self.frame_grad, bg="#25252b")
         grad_hex_frame.pack(fill=tk.X, pady=5)
 
@@ -1341,6 +2008,8 @@ class KeyboardVisualizerApp:
         self.update_grad_circles()
         rgb = self.grad_start_rgb if target == "start" else self.grad_end_rgb
         self.grad_picker.set_color_from_rgb(*rgb)
+        if hasattr(self, "grad_rgb_sliders"):
+            self.grad_rgb_sliders.set_rgb(*rgb)
         self.entry_grad_hex.delete(0, tk.END)
         self.entry_grad_hex.insert(0, f"#{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}")
 
@@ -1364,8 +2033,26 @@ class KeyboardVisualizerApp:
         else:
             self.grad_end_rgb = (r, g, b)
 
+        if hasattr(self, "grad_rgb_sliders"):
+            self.grad_rgb_sliders.set_rgb(r, g, b)
+
         self.entry_grad_hex.delete(0, tk.END)
         self.entry_grad_hex.insert(0, hex_code.upper())
+        self.update_grad_circles()
+        if self.grad_active_var.get():
+            self.render_keyboard()
+
+    def on_grad_rgb_sliders_change(self, r, g, b):
+        """Вызывается при изменении слайдеров R/G/B на вкладке градиента
+        (перетаскиванием или вводом значения)."""
+        self.grad_picker.set_color_from_rgb(r, g, b)
+        if self.active_grad_target == "start":
+            self.grad_start_rgb = (r, g, b)
+        else:
+            self.grad_end_rgb = (r, g, b)
+
+        self.entry_grad_hex.delete(0, tk.END)
+        self.entry_grad_hex.insert(0, self.grad_picker.get_hex().upper())
         self.update_grad_circles()
         if self.grad_active_var.get():
             self.render_keyboard()
@@ -1379,6 +2066,8 @@ class KeyboardVisualizerApp:
             g = int(val[3:5], 16)
             b = int(val[5:7], 16)
             self.grad_picker.set_color_from_rgb(r, g, b)
+            if hasattr(self, "grad_rgb_sliders"):
+                self.grad_rgb_sliders.set_rgb(r, g, b)
             if self.active_grad_target == "start":
                 self.grad_start_rgb = (r, g, b)
             else:
@@ -1424,6 +2113,8 @@ class KeyboardVisualizerApp:
             if col_data:
                 hex_val, (r, g, b), _ = col_data
                 self.picker.set_color_from_rgb(r, g, b)
+                if hasattr(self, "rgb_sliders"):
+                    self.rgb_sliders.set_rgb(r, g, b)
                 self.update_hex_entry(hex_val)
 
         self.lbl_info.config(text=self.tr("selected", n=len(self.selected_keys)))
@@ -1467,6 +2158,15 @@ class KeyboardVisualizerApp:
 
     def on_picker_color_change(self, hex_code):
         self.update_hex_entry(hex_code)
+        if hasattr(self, "rgb_sliders"):
+            self.rgb_sliders.set_rgb(*self.picker.get_rgb())
+        if self.selected_keys:
+            self.apply_color_to_selection()
+
+    def on_rgb_sliders_change(self, r, g, b):
+        """Вызывается при изменении слайдеров R/G/B (перетаскиванием или вводом значения)."""
+        self.picker.set_color_from_rgb(r, g, b)
+        self.update_hex_entry(self.picker.get_hex())
         if self.selected_keys:
             self.apply_color_to_selection()
 
@@ -1483,6 +2183,8 @@ class KeyboardVisualizerApp:
             g = int(val[3:5], 16)
             b = int(val[5:7], 16)
             self.picker.set_color_from_rgb(r, g, b)
+            if hasattr(self, "rgb_sliders"):
+                self.rgb_sliders.set_rgb(r, g, b)
             self.apply_color_to_selection()
         except Exception:
             messagebox.showerror(self.tr("error"), self.tr("invalid_hex"))
@@ -1652,8 +2354,12 @@ class KeyboardVisualizerApp:
         picker.draw_hue_marker()
         picker.draw_sv_square()
 
-    def apply_rgb_to_keyboard(self):
-        """Send the current virtual-keyboard RGB state directly to Galaxy 70."""
+    def apply_rgb_to_keyboard(self, preset_name=None):
+        """Send the current virtual-keyboard RGB state directly to Galaxy 70.
+
+        preset_name: если задано, значит подсветка отправляется в рамках
+        применения пресета — используется только для текста статуса/уведомления.
+        """
         try:
             color_map = build_live_color_map(self)
         except Exception as e:
@@ -1667,20 +2373,228 @@ class KeyboardVisualizerApp:
             try:
                 Galaxy70HidTransport().apply_rgb_map(color_map)
             except Exception as exc:  # noqa: BLE001
-                self.root.after(0, lambda: self._finish_apply_rgb(False, str(exc)))
+                self.root.after(0, lambda: self._finish_apply_rgb(False, str(exc), preset_name))
             else:
-                self.root.after(0, lambda: self._finish_apply_rgb(True, None))
+                self.root.after(0, lambda: self._finish_apply_rgb(True, None, preset_name))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_apply_rgb(self, success, error_text):
+    def _finish_apply_rgb(self, success, error_text, preset_name=None):
         self.btn_apply_rgb.config(state=tk.NORMAL, text=self.tr("apply_rgb"))
+
         if success:
-            self.lbl_info.config(text=self.tr("apply_rgb_success"))
-            messagebox.showinfo(self.tr("success"), self.tr("apply_rgb_success"))
+            if preset_name:
+                self.lbl_info.config(text=self.tr("preset_applied", name=preset_name))
+            else:
+                self.lbl_info.config(text=self.tr("apply_rgb_success"))
         else:
             self.lbl_info.config(text=self.tr("error"))
-            messagebox.showerror(self.tr("error"), self.tr("apply_rgb_error", error=error_text))
+
+    def _build_project_dict(self):
+        """Собирает полный снимок текущего состояния программы (используется
+        и для Save Project, и для сохранения пресетов)."""
+        return {
+            "format": "Galaxy70EditorProject",
+            "version": 1,
+            "window": {
+                "geometry": self.root.geometry()
+            },
+            "profile": {
+                "label": self.lbl_profile.cget("text"),
+                "xml": (
+                    ET.tostring(
+                        self.xml_tree.getroot(),
+                        encoding="unicode"
+                    )
+                    if self.xml_tree is not None else None
+                )
+            },
+            "colors": {
+                "base": self._serialize_color_map(self.base_colors),
+                "manual_overrides": self._serialize_color_map(self.manual_overrides)
+            },
+            "selection": {
+                "selected_keys": sorted(self.selected_keys),
+                "base_selected_keys": sorted(self.base_selected_keys)
+            },
+            "gradient": {
+                "active": bool(self.grad_active_var.get()),
+                "invert": bool(self.grad_invert_var.get()),
+                "contrast": int(self.grad_contrast),
+                "mode": self.grad_mode_key(),
+                "method": self.grad_method_key(),
+                "start_rgb": list(self.grad_start_rgb),
+                "end_rgb": list(self.grad_end_rgb),
+                "active_target": self.active_grad_target,
+                "picker": self._get_picker_state(self.grad_picker),
+                "hex": self.entry_grad_hex.get()
+            },
+            "color_correction": {
+                "active": bool(self.cc_active_var.get()),
+                "hue": int(self.scale_hue.get()),
+                "saturation": int(self.scale_sat.get()),
+                "value": int(self.scale_val.get())
+            },
+            "manual_picker": {
+                "picker": self._get_picker_state(self.picker),
+                "hex": self.entry_hex.get()
+            },
+            "ui": {
+                "active_tab": self.active_tab
+            }
+        }
+
+    def _apply_project_dict(self, project, restore_geometry=True):
+        """Восстанавливает состояние программы из словаря проекта (используется
+        и Open Project, и применением пресетов). Бросает исключение при ошибке —
+        обработка и текст сообщения остаются на вызывающей стороне."""
+        if project.get("format") != "Galaxy70EditorProject":
+            raise ValueError(self.tr("not_project"))
+
+        version = int(project.get("version", 1))
+        if version != 1:
+            raise ValueError(
+                self.tr("unsupported_version", version=version)
+            )
+
+        profile = project.get("profile", {})
+        xml_text = profile.get("xml")
+
+        if xml_text:
+            root_elem = ET.fromstring(xml_text)
+            self.xml_tree = ET.ElementTree(root_elem)
+        else:
+            self.xml_tree = None
+
+        colors = project.get("colors", {})
+        self.base_colors = self._deserialize_color_map(
+            colors.get("base", {})
+        )
+        self.manual_overrides = self._deserialize_color_map(
+            colors.get("manual_overrides", {})
+        )
+
+        selection = project.get("selection", {})
+        self.selected_keys = set(
+            int(v) for v in selection.get("selected_keys", [])
+        )
+        self.base_selected_keys = set(
+            int(v) for v in selection.get("base_selected_keys", [])
+        )
+
+        gradient = project.get("gradient", {})
+        self.grad_active_var.set(bool(gradient.get("active", False)))
+        self.grad_invert_var.set(bool(gradient.get("invert", False)))
+        self.grad_contrast = int(gradient.get("contrast", 0))
+
+        self.grad_start_rgb = tuple(
+            int(v) for v in gradient.get("start_rgb", [255, 255, 255])
+        )
+        self.grad_end_rgb = tuple(
+            int(v) for v in gradient.get("end_rgb", [0, 0, 0])
+        )
+        self.active_grad_target = gradient.get(
+            "active_target", "start"
+        )
+
+        grad_mode_raw = gradient.get("mode", "horizontal")
+        grad_method_raw = gradient.get("method", "hsv")
+
+        grad_mode = grad_mode_raw if grad_mode_raw in GRAD_MODE_KEYS else next(
+            (key for key, values in GRAD_MODE_KEYS.items() if grad_mode_raw in values), "horizontal"
+        )
+        grad_method = grad_method_raw if grad_method_raw in GRAD_METHOD_KEYS else next(
+            (key for key, values in GRAD_METHOD_KEYS.items() if grad_method_raw in values), "hsv"
+        )
+
+        self.combo_grad_mode.set(self.grad_mode_display(grad_mode))
+        self.combo_grad_method.set(self.grad_method_display(grad_method))
+        self.scale_grad_contrast.set(self.grad_contrast)
+
+        grad_picker_state = gradient.get("picker")
+        if grad_picker_state:
+            self._set_picker_state(
+                self.grad_picker, grad_picker_state
+            )
+
+        grad_hex = gradient.get("hex", "")
+        self.entry_grad_hex.delete(0, tk.END)
+        self.entry_grad_hex.insert(0, grad_hex)
+
+        if hasattr(self, "grad_rgb_sliders"):
+            self.grad_rgb_sliders.set_rgb(*self.grad_picker.get_rgb())
+
+        cc = project.get("color_correction", {})
+        cc_active = bool(cc.get("active", False))
+        self.cc_active_var.set(cc_active)
+        self.toggle_cc_state()
+
+        try:
+            hue = max(-180, min(180, int(cc.get("hue", 0))))
+        except (TypeError, ValueError):
+            hue = 0
+        try:
+            saturation = max(-100, min(100, int(cc.get("saturation", 0))))
+        except (TypeError, ValueError):
+            saturation = 0
+        try:
+            value = max(-100, min(100, int(cc.get("value", 0))))
+        except (TypeError, ValueError):
+            value = 0
+
+        self.scale_hue.set(hue)
+        self.scale_sat.set(saturation)
+        self.scale_val.set(value)
+
+        self.toggle_cc_state()
+
+        manual_picker = project.get("manual_picker", {})
+        picker_state = manual_picker.get("picker")
+        if picker_state:
+            self._set_picker_state(
+                self.picker, picker_state
+            )
+
+        manual_hex = manual_picker.get("hex", "")
+        self.entry_hex.delete(0, tk.END)
+        self.entry_hex.insert(0, manual_hex)
+
+        if hasattr(self, "rgb_sliders"):
+            self.rgb_sliders.set_rgb(*self.picker.get_rgb())
+
+        profile_label = profile.get("label", self.tr("profile_not_loaded"))
+        self.profile_name = None
+        for prefix in (LANG["ru"]["profile"].split("{name}")[0], LANG["en"]["profile"].split("{name}")[0]):
+            if profile_label.startswith(prefix):
+                self.profile_name = profile_label[len(prefix):]
+                break
+        if self.profile_name is None and profile_label not in (LANG["ru"]["profile_not_loaded"], LANG["en"]["profile_not_loaded"]):
+            self.profile_name = profile_label
+
+        self.lbl_profile.config(
+            text=self.tr("profile", name=self.profile_name) if self.profile_name else self.tr("profile_not_loaded"),
+            fg="#ffffff"
+        )
+
+        ui = project.get("ui", {})
+        active_tab = ui.get("active_tab", "manual")
+        if active_tab not in {"manual", "grad", "cc"}:
+            active_tab = "manual"
+
+        if restore_geometry:
+            geometry = project.get("window", {}).get("geometry")
+            if geometry:
+                try:
+                    self.root.geometry(geometry)
+                except tk.TclError:
+                    pass
+
+        self.update_grad_circles()
+        self.select_grad_target(self.active_grad_target)
+        self.switch_tab(active_tab)
+        self.toggle_grad_state()
+        self.toggle_cc_state()
+        self.render_keyboard()
 
     def save_project(self):
         if not self.xml_tree:
@@ -1703,56 +2617,7 @@ class KeyboardVisualizerApp:
             return
 
         try:
-            project = {
-                "format": "Galaxy70EditorProject",
-                "version": 1,
-                "window": {
-                    "geometry": self.root.geometry()
-                },
-                "profile": {
-                    "label": self.lbl_profile.cget("text"),
-                    "xml": (
-                        ET.tostring(
-                            self.xml_tree.getroot(),
-                            encoding="unicode"
-                        )
-                        if self.xml_tree is not None else None
-                    )
-                },
-                "colors": {
-                    "base": self._serialize_color_map(self.base_colors),
-                    "manual_overrides": self._serialize_color_map(self.manual_overrides)
-                },
-                "selection": {
-                    "selected_keys": sorted(self.selected_keys),
-                    "base_selected_keys": sorted(self.base_selected_keys)
-                },
-                "gradient": {
-                    "active": bool(self.grad_active_var.get()),
-                    "invert": bool(self.grad_invert_var.get()),
-                    "contrast": int(self.grad_contrast),
-                    "mode": self.grad_mode_key(),
-                    "method": self.grad_method_key(),
-                    "start_rgb": list(self.grad_start_rgb),
-                    "end_rgb": list(self.grad_end_rgb),
-                    "active_target": self.active_grad_target,
-                    "picker": self._get_picker_state(self.grad_picker),
-                    "hex": self.entry_grad_hex.get()
-                },
-                "color_correction": {
-                    "active": bool(self.cc_active_var.get()),
-                    "hue": int(self.scale_hue.get()),
-                    "saturation": int(self.scale_sat.get()),
-                    "value": int(self.scale_val.get())
-                },
-                "manual_picker": {
-                    "picker": self._get_picker_state(self.picker),
-                    "hex": self.entry_hex.get()
-                },
-                "ui": {
-                    "active_tab": self.active_tab
-                }
-            }
+            project = self._build_project_dict()
 
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(project, f, ensure_ascii=False, indent=2)
@@ -1784,148 +2649,8 @@ class KeyboardVisualizerApp:
             with open(file_path, "r", encoding="utf-8") as f:
                 project = json.load(f)
 
-            if project.get("format") != "Galaxy70EditorProject":
-                raise ValueError(self.tr("not_project"))
-
-            version = int(project.get("version", 1))
-            if version != 1:
-                raise ValueError(
-                    self.tr("unsupported_version", version=version)
-                )
-
-            profile = project.get("profile", {})
-            xml_text = profile.get("xml")
-
-            if xml_text:
-                root_elem = ET.fromstring(xml_text)
-                self.xml_tree = ET.ElementTree(root_elem)
-            else:
-                self.xml_tree = None
-
-            colors = project.get("colors", {})
-            self.base_colors = self._deserialize_color_map(
-                colors.get("base", {})
-            )
-            self.manual_overrides = self._deserialize_color_map(
-                colors.get("manual_overrides", {})
-            )
-
-            selection = project.get("selection", {})
-            self.selected_keys = set(
-                int(v) for v in selection.get("selected_keys", [])
-            )
-            self.base_selected_keys = set(
-                int(v) for v in selection.get("base_selected_keys", [])
-            )
-
-            gradient = project.get("gradient", {})
-            self.grad_active_var.set(bool(gradient.get("active", False)))
-            self.grad_invert_var.set(bool(gradient.get("invert", False)))
-            self.grad_contrast = int(gradient.get("contrast", 0))
-
-            self.grad_start_rgb = tuple(
-                int(v) for v in gradient.get("start_rgb", [255, 255, 255])
-            )
-            self.grad_end_rgb = tuple(
-                int(v) for v in gradient.get("end_rgb", [0, 0, 0])
-            )
-            self.active_grad_target = gradient.get(
-                "active_target", "start"
-            )
-
-            grad_mode_raw = gradient.get("mode", "horizontal")
-            grad_method_raw = gradient.get("method", "hsv")
-
-            grad_mode = grad_mode_raw if grad_mode_raw in GRAD_MODE_KEYS else next(
-                (key for key, values in GRAD_MODE_KEYS.items() if grad_mode_raw in values), "horizontal"
-            )
-            grad_method = grad_method_raw if grad_method_raw in GRAD_METHOD_KEYS else next(
-                (key for key, values in GRAD_METHOD_KEYS.items() if grad_method_raw in values), "hsv"
-            )
-
-            self.combo_grad_mode.set(self.grad_mode_display(grad_mode))
-            self.combo_grad_method.set(self.grad_method_display(grad_method))
-            self.scale_grad_contrast.set(self.grad_contrast)
-
-            grad_picker_state = gradient.get("picker")
-            if grad_picker_state:
-                self._set_picker_state(
-                    self.grad_picker, grad_picker_state
-                )
-
-            grad_hex = gradient.get("hex", "")
-            self.entry_grad_hex.delete(0, tk.END)
-            self.entry_grad_hex.insert(0, grad_hex)
-
-            cc = project.get("color_correction", {})
-            cc_active = bool(cc.get("active", False))
-            self.cc_active_var.set(cc_active)
-            self.toggle_cc_state()
-
-            try:
-                hue = max(-180, min(180, int(cc.get("hue", 0))))
-            except (TypeError, ValueError):
-                hue = 0
-            try:
-                saturation = max(-100, min(100, int(cc.get("saturation", 0))))
-            except (TypeError, ValueError):
-                saturation = 0
-            try:
-                value = max(-100, min(100, int(cc.get("value", 0))))
-            except (TypeError, ValueError):
-                value = 0
-
-            self.scale_hue.set(hue)
-            self.scale_sat.set(saturation)
-            self.scale_val.set(value)
-
-            self.toggle_cc_state()
-
-            manual_picker = project.get("manual_picker", {})
-            picker_state = manual_picker.get("picker")
-            if picker_state:
-                self._set_picker_state(
-                    self.picker, picker_state
-                )
-
-            manual_hex = manual_picker.get("hex", "")
-            self.entry_hex.delete(0, tk.END)
-            self.entry_hex.insert(0, manual_hex)
-
-            profile_label = profile.get("label", self.tr("profile_not_loaded"))
-            self.profile_name = None
-            for prefix in (LANG["ru"]["profile"].split("{name}")[0], LANG["en"]["profile"].split("{name}")[0]):
-                if profile_label.startswith(prefix):
-                    self.profile_name = profile_label[len(prefix):]
-                    break
-            if self.profile_name is None and profile_label not in (LANG["ru"]["profile_not_loaded"], LANG["en"]["profile_not_loaded"]):
-                self.profile_name = profile_label
-
-            self.lbl_profile.config(
-                text=self.tr("profile", name=self.profile_name) if self.profile_name else self.tr("profile_not_loaded"),
-                fg="#ffffff"
-            )
-
-            ui = project.get("ui", {})
-            active_tab = ui.get("active_tab", "manual")
-            if active_tab not in {"manual", "grad", "cc"}:
-                active_tab = "manual"
-
+            self._apply_project_dict(project, restore_geometry=True)
             self.current_project_path = file_path
-
-            geometry = project.get("window", {}).get("geometry")
-            if geometry:
-                try:
-                    self.root.geometry(geometry)
-                except tk.TclError:
-                    pass
-
-            self.update_grad_circles()
-            self.select_grad_target(self.active_grad_target)
-            self.switch_tab(active_tab)
-            self.toggle_grad_state()
-            self.toggle_cc_state()
-            self.render_keyboard()
 
             self.lbl_info.config(
                 text=(
@@ -1938,6 +2663,564 @@ class KeyboardVisualizerApp:
                 self.tr("error"),
                 self.tr("open_project_error", error=e)
             )
+
+    # ---------------------------------------------------------------
+    # Пресеты подсветки
+    # ---------------------------------------------------------------
+
+    def toggle_presets_panel(self):
+        if self.presets_panel_visible:
+            self.presets_panel.pack_forget()
+            self.presets_panel_visible = False
+            self._resize_window_by(delta_w=-(self.PRESETS_PANEL_WIDTH + self.PRESETS_PANEL_PADX))
+        else:
+            self.presets_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(self.PRESETS_PANEL_PADX, 0))
+            self.presets_panel_visible = True
+            self.refresh_presets_list()
+            self._resize_window_by(delta_w=(self.PRESETS_PANEL_WIDTH + self.PRESETS_PANEL_PADX))
+
+    def _resize_window_by(self, delta_w=0, delta_h=0):
+        """Расширяет/сужает окно программы на заданную дельту по ширине и/или
+        высоте, сохраняя его текущую позицию на экране. Используется и
+        панелью пресетов (по ширине), и спойлерами RGB-слайдеров (по высоте) —
+        чтобы новый контент не обрезался, а окно не приходилось растягивать вручную."""
+        self.root.update_idletasks()
+        match = re.match(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)", self.root.geometry())
+        if not match:
+            return
+
+        width, height, x, y = match.groups()
+        new_width = max(700, int(width) + delta_w)
+        new_height = max(500, int(height) + delta_h)
+        try:
+            self.root.geometry(f"{new_width}x{new_height}{x}{y}")
+        except tk.TclError:
+            pass
+
+    def _list_preset_files(self):
+        """Возвращает список (display_name, file_path), отсортированный по имени."""
+        presets_dir = get_presets_dir()
+        items = []
+        try:
+            filenames = os.listdir(presets_dir)
+        except OSError:
+            filenames = []
+
+        for filename in filenames:
+            if not filename.lower().endswith(".eglx"):
+                continue
+            file_path = os.path.join(presets_dir, filename)
+            display_name = os.path.splitext(filename)[0]
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                display_name = data.get("preset_name", display_name)
+            except Exception:
+                pass
+            items.append((display_name, file_path))
+
+        items.sort(key=lambda pair: pair[0].lower())
+        return items
+
+    def refresh_presets_list(self):
+        """Перестраивает список кнопок пресетов внутри панели."""
+        for widget in self.preset_widgets:
+            widget.destroy()
+        self.preset_widgets = []
+
+        presets = self._list_preset_files()
+
+        if not presets:
+            lbl_empty = tk.Label(
+                self.presets_list_frame, text=self.tr("no_presets"),
+                font=("Segoe UI", 8), bg="#25252b", fg="#777777",
+                wraplength=190, justify="left"
+            )
+            lbl_empty.pack(fill=tk.X, pady=8)
+            self.preset_widgets.append(lbl_empty)
+            return
+
+        for display_name, file_path in presets:
+            row = tk.Frame(self.presets_list_frame, bg="#25252b")
+            row.pack(fill=tk.X, pady=2)
+
+            btn_preset = tk.Button(
+                row, text=display_name, anchor="w",
+                command=lambda p=file_path: self.apply_preset(p),
+                font=("Segoe UI", 9), bg="#1e1e24", fg="#ffffff",
+                relief=tk.FLAT, padx=8, pady=5, cursor="hand2"
+            )
+            btn_preset.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            btn_delete = tk.Button(
+                row, text="✕",
+                command=lambda p=file_path, n=display_name: self.delete_preset(p, n),
+                font=("Segoe UI", 8, "bold"), bg="#1e1e24", fg="#aa5555",
+                relief=tk.FLAT, padx=6, pady=5, cursor="hand2"
+            )
+            btn_delete.pack(side=tk.RIGHT, padx=(4, 0))
+
+            self.preset_widgets.append(row)
+
+    def save_preset(self):
+        name = simpledialog.askstring(
+            self.tr("preset_name_title"),
+            self.tr("preset_name_prompt"),
+            parent=self.root
+        )
+        if name is None:
+            return
+
+        name = name.strip()
+        if not name:
+            messagebox.showerror(self.tr("error"), self.tr("preset_empty_name"))
+            return
+
+        try:
+            presets_dir = get_presets_dir()
+            safe_name = sanitize_filename(name)
+            file_path = os.path.join(presets_dir, f"{safe_name}.eglx")
+
+            if os.path.exists(file_path):
+                overwrite = messagebox.askyesno(
+                    self.tr("warning"),
+                    self.tr("preset_exists_overwrite", name=name)
+                )
+                if not overwrite:
+                    return
+
+            project = self._build_project_dict()
+            project["preset_name"] = name
+
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(project, f, ensure_ascii=False, indent=2)
+
+            if self.presets_panel_visible:
+                self.refresh_presets_list()
+
+            self.lbl_info.config(text=self.tr("preset_saved", name=name))
+
+        except Exception as e:
+            messagebox.showerror(
+                self.tr("error"),
+                self.tr("preset_save_error", error=e)
+            )
+
+    def apply_preset(self, file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                project = json.load(f)
+
+            preset_name = project.get("preset_name", os.path.splitext(os.path.basename(file_path))[0])
+
+            # Восстанавливаем градиенты/цветокоррекцию/ручные цвета так же,
+            # как это делает Open Project, но не трогаем геометрию окна.
+            self._apply_project_dict(project, restore_geometry=False)
+
+            # Запоминаем, какой пресет применён последним — нужно для
+            # циклического переключения по хоткеям (cycle_preset).
+            self._last_applied_preset_path = file_path
+
+            # Отправляем итоговую подсветку на клавиатуру — по той же логике,
+            # что и кнопка Apply RGB. Статус/уведомление сформируются с именем пресета.
+            self.apply_rgb_to_keyboard(preset_name=preset_name)
+
+        except Exception as e:
+            messagebox.showerror(
+                self.tr("error"),
+                self.tr("preset_apply_error", error=e)
+            )
+
+    def cycle_preset(self, direction=1):
+        """Переключает подсветку клавиатуры на следующий (direction=1) или
+        предыдущий (direction=-1) пресет по списку — в том же порядке, что и
+        в панели пресетов/трее. Используется хоткеями Fn+=/Fn+- (или другими,
+        назначенными в настройках)."""
+        presets = self._list_preset_files()
+        if not presets:
+            return
+
+        paths = [p for _, p in presets]
+        current = self._last_applied_preset_path
+
+        if current in paths:
+            idx = (paths.index(current) + direction) % len(paths)
+        else:
+            idx = 0 if direction > 0 else -1
+
+        self.apply_preset(paths[idx])
+
+    # --- Глобальные хоткеи -----------------------------------------------
+
+    def _on_global_key_event(self, vk, scan, extended, mods):
+        """Вызывается из потока WinAPI-хука — сразу передаём обработку в
+        основной поток Tkinter, трогать виджеты из чужого потока нельзя."""
+        try:
+            self.root.after(0, self._handle_global_key_event, vk, scan, extended, mods)
+        except Exception:
+            pass
+
+    def _handle_global_key_event(self, vk, scan, extended, mods):
+        # Если сейчас открыт диалог настроек и идёт запись новой комбинации —
+        # перехватываем это нажатие как записываемый хоткей и не даём ему
+        # сработать как обычному переключателю пресетов.
+        if self._hotkey_capture_target is not None:
+            self._finish_hotkey_capture(vk, scan, extended, mods)
+            return
+
+        next_binding = self.settings.get("hotkey_next_preset")
+        prev_binding = self.settings.get("hotkey_prev_preset")
+
+        if hotkey_bindings_equal(next_binding, vk, scan, extended, mods):
+            self.cycle_preset(1)
+        elif hotkey_bindings_equal(prev_binding, vk, scan, extended, mods):
+            self.cycle_preset(-1)
+
+    def _finish_hotkey_capture(self, vk, scan, extended, mods):
+        """Завершает запись хоткея в диалоге настроек: сохраняет привязку и
+        обновляет соответствующие виджеты (если диалог всё ещё открыт)."""
+        target = self._hotkey_capture_target
+        self._hotkey_capture_target = None
+        widgets = self._hotkey_capture_widgets
+        self._hotkey_capture_widgets = None
+
+        if target is None:
+            return
+
+        setting_key = "hotkey_next_preset" if target == "next" else "hotkey_prev_preset"
+        binding = {
+            "vk": vk, "scan": scan, "ext": bool(extended),
+            "ctrl": bool(mods.get("ctrl")), "alt": bool(mods.get("alt")),
+            "shift": bool(mods.get("shift")), "win": bool(mods.get("win")),
+        }
+        self.settings[setting_key] = binding
+        save_app_settings(self.settings)
+
+        if widgets is not None:
+            label_var, btn_record = widgets
+            try:
+                label_var.set(hotkey_binding_to_label(binding))
+                btn_record.config(state=tk.NORMAL)
+            except tk.TclError:
+                pass  # диалог уже закрыт
+
+    def delete_preset(self, file_path, display_name):
+        confirm = messagebox.askyesno(
+            self.tr("warning"),
+            self.tr("preset_delete_confirm", name=display_name)
+        )
+        if not confirm:
+            return
+        try:
+            os.remove(file_path)
+            self.refresh_presets_list()
+        except Exception as e:
+            messagebox.showerror(
+                self.tr("error"),
+                self.tr("preset_delete_error", error=e)
+            )
+
+    # ---------------------------------------------------------------
+    # Настройки приложения (автозапуск / трей)
+    # ---------------------------------------------------------------
+
+    def open_settings_dialog(self):
+        if self._settings_win is not None and self._settings_win.winfo_exists():
+            self._settings_win.lift()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title(self.tr("settings_title"))
+        win.configure(bg="#25252b")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+        self._settings_win = win
+
+        container = tk.Frame(win, bg="#25252b", padx=18, pady=16)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(
+            container, text=self.tr("settings_title"), font=("Segoe UI", 11, "bold"),
+            bg="#25252b", fg="#ffffff"
+        ).pack(anchor="w", pady=(0, 12))
+
+        var_startup = tk.BooleanVar(value=is_run_at_startup())
+        var_start_min = tk.BooleanVar(value=bool(self.settings.get("start_minimized", False)))
+        var_close_min = tk.BooleanVar(value=bool(self.settings.get("minimize_on_close", False)))
+
+        chk_style = dict(
+            bg="#25252b", fg="#ffffff", activebackground="#25252b", activeforeground="#ffffff",
+            selectcolor="#1e1e24", font=("Segoe UI", 10), anchor="w", justify="left",
+            highlightthickness=0
+        )
+
+        def on_toggle_startup():
+            if winreg is None:
+                messagebox.showwarning(self.tr("warning"), self.tr("startup_unsupported"))
+                var_startup.set(False)
+                return
+            try:
+                set_run_at_startup(var_startup.get())
+            except Exception as e:
+                messagebox.showerror(self.tr("error"), self.tr("startup_error", error=e))
+                var_startup.set(is_run_at_startup())
+
+        def on_toggle_start_min():
+            if var_start_min.get() and not TRAY_LIBS_AVAILABLE:
+                messagebox.showwarning(self.tr("warning"), self.tr("tray_unavailable"))
+                var_start_min.set(False)
+                return
+            self.settings["start_minimized"] = bool(var_start_min.get())
+            save_app_settings(self.settings)
+
+        def on_toggle_close_min():
+            if var_close_min.get() and not TRAY_LIBS_AVAILABLE:
+                messagebox.showwarning(self.tr("warning"), self.tr("tray_unavailable"))
+                var_close_min.set(False)
+                return
+            self.settings["minimize_on_close"] = bool(var_close_min.get())
+            save_app_settings(self.settings)
+
+        tk.Checkbutton(
+            container, text=self.tr("setting_run_at_startup"), variable=var_startup,
+            command=on_toggle_startup, **chk_style
+        ).pack(fill=tk.X, pady=4)
+
+        tk.Checkbutton(
+            container, text=self.tr("setting_start_minimized"), variable=var_start_min,
+            command=on_toggle_start_min, **chk_style
+        ).pack(fill=tk.X, pady=4)
+
+        tk.Checkbutton(
+            container, text=self.tr("setting_minimize_on_close"), variable=var_close_min,
+            command=on_toggle_close_min, **chk_style
+        ).pack(fill=tk.X, pady=4)
+
+        if not TRAY_LIBS_AVAILABLE:
+            tk.Label(
+                container, text=self.tr("tray_libs_missing_note"), font=("Segoe UI", 8),
+                bg="#25252b", fg="#c9a24b", wraplength=280, justify="left"
+            ).pack(fill=tk.X, pady=(10, 0))
+
+        # --- Горячие клавиши переключения пресетов ---------------------
+
+        tk.Frame(container, bg="#3a3a42", height=1).pack(fill=tk.X, pady=(14, 10))
+
+        tk.Label(
+            container, text=self.tr("hotkeys_section_title"), font=("Segoe UI", 10, "bold"),
+            bg="#25252b", fg="#ffffff"
+        ).pack(anchor="w", pady=(0, 8))
+
+        self._hotkey_row_refs = {}
+
+        def build_hotkey_row(setting_key, label_text, target):
+            row = tk.Frame(container, bg="#25252b")
+            row.pack(fill=tk.X, pady=4)
+
+            tk.Label(
+                row, text=label_text, font=("Segoe UI", 9), bg="#25252b", fg="#cccccc",
+                width=14, anchor="w"
+            ).pack(side=tk.LEFT)
+
+            current_binding = self.settings.get(setting_key)
+            label_var = tk.StringVar(
+                value=hotkey_binding_to_label(current_binding) or self.tr("hotkey_not_set")
+            )
+            tk.Label(
+                row, textvariable=label_var, font=("Segoe UI", 9, "bold"), bg="#1e1e24",
+                fg="#ffffff", anchor="w", padx=8, pady=4, width=15
+            ).pack(side=tk.LEFT, padx=(6, 6))
+
+            btn_record = tk.Button(
+                row, text=self.tr("hotkey_record"), font=("Segoe UI", 8, "bold"),
+                bg="#495057", fg="white", relief=tk.FLAT, padx=8, pady=3, cursor="hand2"
+            )
+            btn_record.pack(side=tk.LEFT, padx=(0, 4))
+
+            btn_clear = tk.Button(
+                row, text="✕", font=("Segoe UI", 8, "bold"),
+                bg="#1e1e24", fg="#aa5555", relief=tk.FLAT, padx=6, pady=3, cursor="hand2"
+            )
+            btn_clear.pack(side=tk.LEFT)
+
+            def start_capture():
+                if self._hotkey_capture_target is not None:
+                    return
+                self._hotkey_capture_target = target
+                self._hotkey_capture_widgets = (label_var, btn_record)
+                label_var.set(self.tr("hotkey_press_now"))
+                btn_record.config(state=tk.DISABLED)
+
+            def clear_binding():
+                self.settings[setting_key] = None
+                save_app_settings(self.settings)
+                label_var.set(self.tr("hotkey_not_set"))
+
+            btn_record.config(command=start_capture)
+            btn_clear.config(command=clear_binding)
+
+            self._hotkey_row_refs[target] = (setting_key, label_var, btn_record)
+
+        build_hotkey_row("hotkey_next_preset", self.tr("hotkey_next_label"), "next")
+        build_hotkey_row("hotkey_prev_preset", self.tr("hotkey_prev_label"), "prev")
+
+        tk.Label(
+            container, text=self.tr("hotkey_note"), font=("Segoe UI", 8),
+            bg="#25252b", fg="#888888", wraplength=280, justify="left"
+        ).pack(fill=tk.X, pady=(8, 0))
+
+        def on_settings_close():
+            # Если диалог закрывают прямо во время записи хоткея — сбрасываем режим записи.
+            self._hotkey_capture_target = None
+            self._hotkey_capture_widgets = None
+            win.destroy()
+
+        tk.Button(
+            container, text=self.tr("close"), command=on_settings_close,
+            font=("Segoe UI", 9, "bold"), bg="#495057", fg="white",
+            relief=tk.FLAT, padx=14, pady=6, cursor="hand2"
+        ).pack(anchor="e", pady=(14, 0))
+
+        win.protocol("WM_DELETE_WINDOW", on_settings_close)
+
+        self._center_toplevel_on_root(win)
+
+    def _center_toplevel_on_root(self, win):
+        """Центрирует всплывающее окно относительно главного окна программы."""
+        win.update_idletasks()
+        win_w = win.winfo_reqwidth()
+        win_h = win.winfo_reqheight()
+
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        root_w = self.root.winfo_width()
+        root_h = self.root.winfo_height()
+
+        x = root_x + (root_w - win_w) // 2
+        y = root_y + (root_h - win_h) // 2
+
+        x = max(0, x)
+        y = max(0, y)
+
+        win.geometry(f"+{x}+{y}")
+
+    # --- Системный трей -------------------------------------------------
+
+    def _build_tray_image(self):
+        """Иконка для трея — берётся из того же icon.ico, что и иконка окна
+        (resource_path гарантирует, что после сборки в .exe через PyInstaller
+        с флагом --add-data файл будет извлечён из самого exe, а не должен
+        лежать рядом отдельным файлом).
+        """
+        icon_path = resource_path("icon.ico")
+        if os.path.exists(icon_path):
+            try:
+                img = Image.open(icon_path)
+                img.load()
+                return img.convert("RGBA")
+            except Exception:
+                pass
+
+        # Фолбэк на случай, если icon.ico не найден/повреждён — рисуем
+        # простую заглушку, чтобы трей всё равно не остался без иконки.
+        size = 64
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.rounded_rectangle([4, 4, size - 4, size - 4], radius=14, fill=(111, 66, 193, 255))
+        text = "G7"
+        try:
+            bbox = draw.textbbox((0, 0), text)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            draw.text(((size - tw) / 2 - bbox[0], (size - th) / 2 - bbox[1]), text, fill="white")
+        except Exception:
+            draw.text((14, 22), text, fill="white")
+        return img
+
+    def _build_tray_menu(self):
+        """Собирает меню трея: сверху — пресеты (в том же порядке, что и в
+        панели программы), затем разделитель, затем Open/Exit."""
+        items = []
+
+        for display_name, file_path in self._list_preset_files():
+            items.append(
+                pystray.MenuItem(display_name, self._make_tray_preset_handler(file_path))
+            )
+
+        if items:
+            items.append(pystray.Menu.SEPARATOR)
+
+        items.append(
+            pystray.MenuItem(
+                "Open Galaxy 70 Editor" if self.lang == "en" else "Открыть Galaxy 70 Editor",
+                self._tray_restore, default=True
+            )
+        )
+        items.append(
+            pystray.MenuItem("Exit" if self.lang == "en" else "Выход", self._tray_exit)
+        )
+
+        return pystray.Menu(*items)
+
+    def _make_tray_preset_handler(self, file_path):
+        """Возвращает обработчик клика по пункту-пресету в трее.
+
+        Клик приходит из потока pystray, поэтому применение пресета
+        (взаимодействие с Tkinter/HID) переносится в основной поток через root.after —
+        сама логика применения (_apply_project_dict + apply_rgb_to_keyboard)
+        идентична выбору пресета внутри программы и кнопке Apply RGB.
+        """
+        def handler(icon=None, item=None):
+            self.root.after(0, lambda: self.apply_preset(file_path))
+        return handler
+
+    def show_tray_icon(self):
+        if not TRAY_LIBS_AVAILABLE or self.tray_icon is not None:
+            return
+        image = self._build_tray_image()
+        menu = self._build_tray_menu()
+        self.tray_icon = pystray.Icon("Galaxy70Editor", image, self.tr("title"), menu)
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def hide_tray_icon(self):
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+            self.tray_icon = None
+
+    def _tray_restore(self, icon=None, item=None):
+        self.root.after(0, self._restore_from_tray)
+
+    def _restore_from_tray(self):
+        self.hide_tray_icon()
+        self.root.deiconify()
+        self.root.state("normal")
+        self.root.lift()
+        self.root.focus_force()
+
+    def _tray_exit(self, icon=None, item=None):
+        self.root.after(0, self._exit_app)
+
+    def _exit_app(self):
+        self.hide_tray_icon()
+        self.hotkey_manager.stop()
+        self.root.destroy()
+
+    def _start_minimized_to_tray(self):
+        self.root.withdraw()
+        self.show_tray_icon()
+
+    def on_close_request(self):
+        """Обработчик закрытия окна (крестик). Сворачивает в трей, если это
+        включено в настройках и нужные библиотеки установлены, иначе закрывает программу."""
+        if self.settings.get("minimize_on_close") and TRAY_LIBS_AVAILABLE:
+            self.root.withdraw()
+            self.show_tray_icon()
+        else:
+            self.hotkey_manager.stop()
+            self.root.destroy()
 
     def load_xml(self):
         file_path = filedialog.askopenfilename(filetypes=[("XML files" if self.lang == "en" else "XML-файлы", "*.xml"), (self.tr("all_files"), "*.*")])
@@ -2032,7 +3315,7 @@ class KeyboardVisualizerApp:
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
 
-            messagebox.showinfo(self.tr("success"), self.tr("xml_saved", path=file_path))
+            self.lbl_info.config(text=self.tr("xml_saved_short", path=os.path.basename(file_path)))
         except Exception as e:
             messagebox.showerror(self.tr("error"), self.tr("xml_export_error", error=e))
 
@@ -2047,6 +3330,17 @@ if __name__ == "__main__":
 
     root = tk.Tk()
 
+    # icon.ico используется и для иконки окна/панели задач, и для иконки в трее
+    # (см. _build_tray_image). Через resource_path() он ищется:
+    #   - рядом со скриптом при обычном запуске `python eglx70.py`;
+    #   - внутри временной папки _MEIPASS при запуске собранного .exe —
+    #     то есть файл должен быть встроен в сам exe при сборке PyInstaller,
+    #     чтобы после компиляции не нужно было носить icon.ico отдельным файлом:
+    #
+    #     pyinstaller --onefile --windowed --icon=icon.ico ^
+    #                 --add-data "icon.ico;." eglx70.py
+    #
+    #   (на macOS/Linux разделитель в --add-data — двоеточие: "icon.ico:.")
     icon_file = resource_path("icon.ico")
     if os.path.exists(icon_file):
         try:
