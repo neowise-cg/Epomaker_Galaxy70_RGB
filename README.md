@@ -29,6 +29,16 @@ A Python (Tkinter) GUI utility for visual customization and generation of RGB li
 - **💾 Custom Project Format (`.eglx`):** Save your current work state, selected keys, filters, and gradient settings to continue later.
 - **📄 XML Import & Export:** Full compatibility with official keyboard lighting profiles.
 - **🌐 Dual-Language Interface:** On-the-fly UI language switching (`RU` / `EN`).
+- **⭐ Preset System:** Slide-out panel for quick-saving and loading lighting presets:
+  - Save, load, and delete presets as separate `.eglxp` files in a local `presets/` folder.
+  - Toggle the panel from a button in the top bar; the window resizes on open/close.
+  - Presets are also listed directly in the system tray menu for one-click switching without opening the app window.
+- **⚙️ Settings Dialog:** New settings window with:
+  - **Run at Windows startup** — adds/removes the app from the Windows Registry `Run` key.
+  - **Start minimized to tray** — launch the app straight into the background.
+  - **Minimize to tray on close** — closing the window sends the app to the tray instead of quitting.
+- **🔔 System Tray Integration:** Runs quietly in the tray, a preset quick-switch menu, and restore/exit controls
+- **⌨️ Global Hotkeys:** Assign global keyboard shortcuts (working even when the app isn't focused) to trigger actions, with an easy "record by pressing" capture UI in Settings. Supports `Ctrl` / `Alt` / `Shift` / `Win` modifier combinations.
 
 ---
 
@@ -56,6 +66,7 @@ The easiest way is to download the pre-compiled `.exe` file:
 ### Requirements:
 - Python 3.8 or higher.
 - Standard `tkinter` library (included by default in Python for Windows).
+- Optional, for full functionality: `pystray` and `Pillow` (system tray icon & menu). If these aren't installed, the app falls back gracefully and the tray/minimize features are simply disabled.
 
 ### How to Run:
 ```bash
